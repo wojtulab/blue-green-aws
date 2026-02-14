@@ -88,7 +88,7 @@
 $ConfigPath = Join-Path $PSScriptRoot "rds_bg_manager.config.ps1"
 $Global:Config = @{
     WindowTitle = "AWS RDS Blue/Green Manager"
-    UpdateUrl = "https://raw.githubusercontent.com/wojtulab/bg-deploy/refs/heads/optimized-rds-bg-manager-15193162551672441847/rds_bg_manager.ps1"
+    UpdateUrl = "https://raw.githubusercontent.com/wojtulab/blue-green-aws/refs/heads/main/rds_bg_manager.ps1"
     LogFileFormat = "rds_manager_{0:yyyyMMdd}.log"
 }
 
