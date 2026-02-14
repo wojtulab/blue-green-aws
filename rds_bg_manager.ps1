@@ -1,4 +1,4 @@
-# VERSION: 2026.02.10.12
+# VERSION: 2026.02.10.15
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -10,6 +10,11 @@
 
 .CHANGELOG
     2026-02-10
+    - Enhanced 'Apply Pending Maintenance': The confirmation prompt ("Apply Immediately?") is now a cancellable menu supporting 'q' and 'ESC' to exit safely at any time.
+    - Updated Show-Menu to support 'q' key for cancellation when filtering is disabled.
+    - Fixed critical safety bug in Multi-Select menus (Update OS, Apply Maintenance, Create Multiple Snapshots) where cancelling via ESC could trigger actions on the last item.
+    - Fixed 'Delete Blue/Green Deployment': Removed redundant 'Cancel' option from instance termination menu (ESC is used to exit).
+    - Improved error logging for 'Create Blue/Green Deployment' to capture full exception details (including stack trace) for better debugging.
     - Added 'Update OS' feature to RDS Management menu. This specialized workflow focuses on applying 'system-update' actions with mandatory safeguards (Snapshot and Monitoring alerts) and immediate application.
     - Added 'Apply Pending Maintenance' feature to RDS Management menu. Allows interactive selection and batch application of pending maintenance actions (e.g., OS updates) with immediate or scheduled opt-in.
     - Removed pre-filtering by Engine in 'Select Active Instance' to allow immediate access to the full instance list with live filtering.
@@ -432,6 +437,12 @@ function Show-Menu {
                     if (![char]::IsControl($char)) {
                         $filter += $char
                         $selection = 0
+                    }
+                } else {
+                    # Allow 'q' to quit if filter is disabled
+                    if ($key.Character -eq 'q') {
+                        try { [Console]::CursorVisible = $true } catch {}
+                        return -1
                     }
                 }
             }
@@ -1959,6 +1970,9 @@ function New-MultipleRDSSnapshots-Interactive {
     # Show Multi-Select Menu
     $selectedIndices = Show-Menu -Title "Create Multiple Snapshots (SPACE to Select)" -Options $options -EnableFilter -MultiSelect
 
+    if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
+    if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
+
     if ($selectedIndices -eq $null -or $selectedIndices.Count -eq 0) {
         Write-Host "No instances selected." -ForegroundColor Yellow
         Read-Host "Press Enter to menu..."
@@ -2351,7 +2365,15 @@ function New-BGDeployment-Interactive {
         $msg = if ($err.Exception) { $err.Exception.Message } else { $err.ToString() }
         
         Write-Log "Deployment Failed: $msg" -ForegroundColor Red
-        Write-Log "Full Trace: $($err | Out-String)"
+        Write-Log "Full Error Details:" -ForegroundColor DarkGray
+        
+        # Log extensive error details
+        $errDetails = $err | Select-Object * | Out-String
+        Write-Log $errDetails
+        
+        if ($err.ScriptStackTrace) {
+             Write-Log "Script Stack Trace:`n$($err.ScriptStackTrace)"
+        }
     }
     Read-Host "Press Enter to menu..."
 }
@@ -2510,8 +2532,7 @@ function Remove-BGDeployment-Interactive {
     $instanceOptions = @(
         "None (Delete Deployment Resource Only)",
         "Instance 1: $sourceId (Source in BG definition)",
-        "Instance 2: $targetId (Target in BG definition)",
-        "Cancel"
+        "Instance 2: $targetId (Target in BG definition)"
     )
 
     $instIdx = Show-Menu -Title "Select Instance to TERMINATE (Delete)" -Options $instanceOptions
@@ -2520,7 +2541,6 @@ function Remove-BGDeployment-Interactive {
 
     if ($instIdx -eq -99) { return } # F1
     if ($instIdx -lt 0) { return } # ESC
-    if ($instIdx -ge ($instanceOptions.Count - 1)) { return } # Cancel
 
     $instanceToDelete = $null
     if ($instIdx -eq 1) { $instanceToDelete = $sourceId }
@@ -2750,6 +2770,8 @@ function Update-OperatingSystem {
         $selectedIndices = Show-Menu -Title "Select Instances to Update OS (SPACE to Select)" -Options $options -EnableFilter -MultiSelect
 
         if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
+        if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
+
         if ($selectedIndices -eq $null -or $selectedIndices.Count -eq 0) {
             Write-Host "No instances selected." -ForegroundColor Yellow
             Read-Host "Press Enter to menu..."
@@ -2864,6 +2886,8 @@ function Apply-PendingMaintenance {
         $selectedIndices = Show-Menu -Title "Select Maintenance Actions to APPLY (SPACE to Select)" -Options $options -EnableFilter -MultiSelect
 
         if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
+        if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
+
         if ($selectedIndices -eq $null -or $selectedIndices.Count -eq 0) {
             Write-Host "No actions selected." -ForegroundColor Yellow
             Read-Host "Press Enter to menu..."
@@ -2878,8 +2902,17 @@ function Apply-PendingMaintenance {
         }
 
         Write-Host ""
-        $applyNow = Read-Host "Apply Immediately? (y/n) [Default: n (Next Window)]"
-        $optIn = if ($applyNow -eq 'y') { "immediate" } else { "next-maintenance" }
+        # Using Show-Menu for timing selection to support ESC/q cancellation
+        $timingOptions = @("Apply Immediately", "Schedule for Next Maintenance Window", "Cancel")
+        $timingIdx = Show-Menu -Title "Select Application Timing (ESC/q to Cancel)" -Options $timingOptions # No Filter enabled implies 'q' quits
+
+        if ($timingIdx -lt 0 -or $timingIdx -eq 2) { 
+            Write-Host "Operation cancelled." -ForegroundColor Yellow
+            Read-Host "Press Enter to menu..."
+            return 
+        }
+
+        $optIn = if ($timingIdx -eq 0) { "immediate" } else { "next-maintenance" }
 
         foreach ($idx in $selectedIndices) {
             $item = $flatList[$idx]
