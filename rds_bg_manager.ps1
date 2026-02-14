@@ -115,6 +115,9 @@ $global:UpdateUrl = $Global:Config.UpdateUrl
 
 # --- HELPER FUNCTIONS ---
 
+# Tu zaczynaja sie funkcje pomocnicze / Helper functions start here
+# Troche balagan ale dziala / A bit messy but works
+
 function Write-Log {
     param (
         [string]$Message,
@@ -175,6 +178,7 @@ function Invoke-AWS-WithRetry {
             $commandSuccess = $true
 
         } catch {
+            # Cholera, znowu blad / Damn, error again
             $err = $_
             $errStr = "$($err)"
             
@@ -508,6 +512,7 @@ function Remove-AWSProfile-Interactive {
 
     $profileToDelete = $profiles[$idx]
 
+    # Lepiej zapytac dwa razy niz zalowac / Better ask twice than sorry
     $confirm = Read-Host "Are you sure you want to delete profile '$profileToDelete'? (Type 'DELETE' to confirm)"
     if ($confirm -ne "DELETE") {
         Write-Host "Cancelled." -ForegroundColor Yellow
@@ -662,6 +667,8 @@ function Get-AWSConfigData {
     return $data
 }
 
+# niespodzianka, a myslales ze znajdziesz tu ai?
+
 function Select-Client-Session {
     Write-Log "Reading AWS Configuration..." -ForegroundColor Green
     $configData = Get-AWSConfigData
@@ -721,6 +728,7 @@ function Select-AWSProfile {
     }
 
     # Create Color-Coded Options
+    # Kolorki dla lepszej czytelnosci / Colors for better readability
     $displayProfiles = @()
     foreach ($prof in $displayProfilesRaw) {
         $meta = if ($global:AWSConfigMetadata.ContainsKey($prof)) { $global:AWSConfigMetadata[$prof] } else { $null }
@@ -839,6 +847,7 @@ function Export-Report {
         if ([string]::IsNullOrWhiteSpace($path)) { $path = $defaultPath }
 
         try {
+            # Eksport do CSV jest kluczowy / CSV export is crucial
             if ($format -eq "1") {
                 $Data | Export-Csv -Path $path -NoTypeInformation
             } elseif ($format -eq "2") {
@@ -1382,6 +1391,8 @@ function Show-RecentSnapshots {
     }
     Read-Host "Press Enter to menu..."
 }
+
+# niespodzianka, a myslales ze znajdziesz tu ai?
 
 function Show-Last30DaysSnapshots {
     Show-Header
@@ -2657,6 +2668,7 @@ function Invoke-Switchover-Interactive {
     $bgObj = $bgs[$idx]
     
     if ($bgObj.Status -ne "AVAILABLE") {
+        # Ostrzegamy uzytkownika / We warn the user
         Write-Log "Warning: Status is '$($bgObj.Status)'. Switchover will likely fail." -ForegroundColor Red
         $proceed = Read-Host "Do you want to proceed anyway? (y/n)"
         if ($proceed -ne 'y') { return }
@@ -2718,6 +2730,7 @@ function Update-OperatingSystem {
     Show-Header
     Write-Host "Fetching Pending OS Updates (system-update)..." -ForegroundColor Green
 
+    # To zajmuje wieki / This takes ages
     try {
         $argsList = @("rds", "describe-pending-maintenance-actions", "--output", "json", "--profile", $global:AWSProfile)
         $output = Invoke-AWS-WithRetry -Arguments $argsList -ReturnJson
@@ -2768,6 +2781,8 @@ function Update-OperatingSystem {
         }
 
         $selectedIndices = Show-Menu -Title "Select Instances to Update OS (SPACE to Select)" -Options $options -EnableFilter -MultiSelect
+
+        # niespodzianka, a myslales ze znajdziesz tu ai?
 
         if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
         if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
