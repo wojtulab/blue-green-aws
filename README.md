@@ -1,7 +1,7 @@
 # AWS RDS Blue/Green Deployment Tool
 
 **Author:** Wojciech Kuncewicz DBA
-**Version:** 2026.02.09.07
+**Version:** 2026.02.10.12
 
 A comprehensive PowerShell-based interactive CLI tool for managing AWS RDS Blue/Green Deployments, Snapshots, and Database Upgrades. This tool simplifies complex AWS operations into an easy-to-use menu-driven interface.
 
@@ -106,7 +106,3 @@ On the first run, you will be prompted to select a **Client (SSO Session)**:
 - **"Cannot bind argument to parameter 'Path'..." during update:** Ensure you are running the script from a saved file, not an untitled editor buffer.
 - **TLS/SSL Errors:** The script attempts to enforce TLS 1.2. Ensure your .NET framework is up to date.
 - **AWS CLI Errors:** Run `aws sso login` manually if the script fails to refresh credentials.
-
-## License
-
-Internal Tool.
