@@ -1,13 +1,13 @@
 # AWS RDS Blue/Green Deployment Tool
 
 **Author:** Wojciech Kuncewicz DBA
-**Version:** 2026.02.10.12
+**Version:** 2026.02.12.02
 
 A comprehensive PowerShell-based interactive CLI tool for managing AWS RDS Blue/Green Deployments, Snapshots, and Database Upgrades. This tool simplifies complex AWS operations into an easy-to-use menu-driven interface.
 
 ## Features
 
-- **Interactive Menu Interface:** Navigate using Arrow Keys, Select with Enter, Toggle multi-selection with Space.
+- **Interactive Menu Interface:** Major UI/UX overhaul featuring "Frozen Headers" and viewport scrolling. Navigate large lists easily without losing context. Supports Search-as-you-type, multi-selection, and fast navigation.
 - **AWS SSO Integration:** Automatically detects and configures AWS profiles.
 - **Client (Session) Filtering:** Filters profiles by AWS SSO Session (Client) for easier navigation.
 - **Environment Awareness:** Parses `env` and `type` fields from `.aws/config` to display visual warnings:
@@ -15,10 +15,12 @@ A comprehensive PowerShell-based interactive CLI tool for managing AWS RDS Blue/
     - **Orange:** Non-Production Read-Write (RW) environments (e.g., Int/Dev/Pre).
     - **Red:** Production Read-Write (RW) environments.
 - **RDS Management:**
-    - **Blue/Green Deployments:** Interactive creation with dynamic Version and Parameter Group selection.
-    - **Snapshot Management:** Create Single/Multiple snapshots, Delete snapshots, Monitor progress (shows 10 freshest snapshots from the last 10 days).
+    - **Blue/Green Deployments:** Interactive creation with dynamic Version and Parameter Group selection. Deletion now includes Replica Lag checks. Includes "Search-as-you-type" instance selection.
+    - **Snapshot Management:** Create Single/Multiple snapshots, Delete snapshots, Monitor progress (shows 10 freshest snapshots from the last 10 days, prioritizing in-progress ones). **Includes Pre-flight Quota Check** (verifies 100 manual snapshot limit).
     - **Database Operations:** Upgrade Engine, View Logs, Check Replica Lag.
-    - **Reporting:** Instance Details, Storage, Backup info (Export to CSV/HTML).
+    - **Update OS:** Specialized workflow for `system-update` maintenance with safeguards (Snapshots, Monitoring alerts).
+    - **Apply Pending Maintenance:** Interactive selection and batch application of pending maintenance actions.
+    - **Reporting:** Instance Details, Storage, Backup info, **Recommendation List** (Compute Optimizer).
 - **EC2 Management:**
     - **Control:** Start/Stop instances interactively.
     - **Snapshots:** Create snapshots of all volumes attached to an instance; Delete snapshots.
@@ -106,3 +108,89 @@ On the first run, you will be prompted to select a **Client (SSO Session)**:
 - **"Cannot bind argument to parameter 'Path'..." during update:** Ensure you are running the script from a saved file, not an untitled editor buffer.
 - **TLS/SSL Errors:** The script attempts to enforce TLS 1.2. Ensure your .NET framework is up to date.
 - **AWS CLI Errors:** Run `aws sso login` manually if the script fails to refresh credentials.
+
+## License
+
+Internal Tool.
+
+## Changelog
+
+### 2026-02-12
+- Refactored 'Delete Snapshots' to use the new viewport engine, allowing search, multi-selection, and bulk deletion of all manual snapshots (removed 50-item limit).
+- Added 'Pre-flight Snapshot Quota Check' for single and multiple snapshot workflows.
+
+### 2026-02-11
+- Maintenance Release: Verified stability of recent safety patches.
+- Documentation Update: Refined internal documentation strings.
+
+### 2026-02-10
+- Enhanced 'Apply Pending Maintenance': The confirmation prompt is now cancellable.
+- Updated Show-Menu to support 'q' key for cancellation.
+- Fixed critical safety bug in Multi-Select menus (Update OS, Apply Maintenance, Create Multiple Snapshots).
+- Fixed 'Delete Blue/Green Deployment': Removed redundant 'Cancel' option.
+- Improved error logging for 'Create Blue/Green Deployment'.
+- Added 'Update OS' feature to RDS Management menu.
+- Added 'Apply Pending Maintenance' feature to RDS Management menu.
+- Removed pre-filtering by Engine in 'Select Active Instance'.
+- Added 'Monitor Instance State' to RDS Management menu.
+- Updated text in Upgrade Database reminder.
+- Fixed 'Upgrade Database Engine' logic (added --include-all).
+- Added 'Recommendation list' report (Compute Optimizer).
+- Enhanced 'Delete Instance(s)' to automatically disable 'Deletion Protection'.
+- Fixed 'Monitor-Snapshot-Progress' to correctly include and prioritize in-progress snapshots.
+- Updated snapshot sorting logic.
+- Added automatic SSO Token refresh prompt.
+- Fixed critical 'No instances selected' bug in Start/Stop/Delete workflows.
+- Enhanced 'Delete Blue/Green Deployment': Added Replica Lag check.
+- Improved Menu UI.
+- Fixed 'Create Blue/Green Deployment' bug (Green DB Name).
+- Removed 'Green DB Name' user input prompt.
+
+### 2026-02-09
+- Fixed 'Create Blue/Green Deployment' error handling (stderr capture).
+- Fixed 'Could not determine parameter group family' error.
+- Added argument trimming to Engine and EngineVersion.
+- Fixed 'Delete Blue/Green Deployment' menu bug.
+- Improved error logging for 'Create Blue/Green Deployment'.
+- Improved debugging info for Parameter Group Family.
+- Added F1 key navigation.
+- Modified Monitor-Snapshot-Progress to be a global monitor.
+- Updated profile color logic (Green/Orange/Red).
+- Added DarkYellow (Orange) warning color.
+- Added automatic OTA update check at startup.
+- Added parsing of 'env' and 'type' fields from .aws/config.
+- Added color-coded environment warnings.
+- Updated 'Create Blue/Green Deployment' menus.
+- Added 'MaxSelectionCount' support to Show-Menu.
+- Fixed bug in single-instance selection menu.
+
+### 2026-02-06
+- Fixed critical bug in Client (Session) selection.
+- Improved AWS Config parsing robustness.
+- Added Client (Session) Selection step.
+- Window Title now reflects Client | Profile - Role.
+- Added interactive 'Delete Profile' option.
+- Added README.md documentation.
+- Changed default Window Title.
+- Fixed OTA version check logic.
+- Added 'Create multiple snapshots' feature.
+- Added 'Delete Snapshots' feature.
+- Moved configuration to external file.
+- Modified Show-Menu to support multi-selection.
+- Modified Monitor-Snapshot-Progress (Last 10 snapshots).
+- Updated snapshot monitoring columns.
+
+### 2026-02-04
+- Split DB Versions report.
+- Added full script logging to file.
+- Added CSV/HTML export.
+- Added dynamic AWS Profile discovery and SSO setup.
+- Added Engine filtering.
+- Added interactive Log Viewer.
+- Fixed Write-Host formatting.
+
+### 2026-02-03
+- Initial implementation of interactive arrow-key navigation.
+- Added visual highlighting for Blue/Green instances.
+- Added Instance Reports structure.
+- Added Other Reports.
