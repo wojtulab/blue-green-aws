@@ -1,4 +1,4 @@
-# VERSION: 2026.02.16.01
+# VERSION: 2026.02.16.09
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -127,6 +127,62 @@ $global:UpdateUrl = $Global:Config.UpdateUrl
 # Tu zaczynaja sie funkcje pomocnicze / Helper functions start here
 # Troche balagan ale dziala / A bit messy but works
 
+# --- ANSI CONSTANTS & HELPERS ---
+$global:ESC = [char]27
+$global:ANSI = @{
+    Reset      = "$($global:ESC)[0m"
+    Black      = "$($global:ESC)[30m"
+    Red        = "$($global:ESC)[31m"
+    Green      = "$($global:ESC)[32m"
+    Yellow     = "$($global:ESC)[93m" # Bright Yellow
+    Blue       = "$($global:ESC)[34m"
+    Magenta    = "$($global:ESC)[35m"
+    Cyan       = "$($global:ESC)[36m"
+    White      = "$($global:ESC)[37m"
+    Gray       = "$($global:ESC)[90m"
+    DarkGray   = "$($global:ESC)[90m"
+    DarkYellow = "$($global:ESC)[33m" # Standard Dim Yellow/Orange
+}
+
+function Get-AnsiColor {
+    param([string]$ColorName)
+    if ($global:ANSI.ContainsKey($ColorName)) { return $global:ANSI[$ColorName] }
+    return $global:ANSI.White
+}
+
+function Get-AnsiString {
+    param(
+        [string]$Text,
+        [string]$Color = "White",
+        [string]$BgColor = $null
+    )
+    $c = Get-AnsiColor $Color
+    return "$c$Text$($global:ANSI.Reset)"
+}
+
+function Strip-Ansi {
+    param([string]$Text)
+    return $Text -replace "\e\[[0-9;]*m", ""
+}
+
+function Pad-Line {
+    param(
+        [string]$Line,
+        [int]$Width = 0
+    )
+    if ($Width -eq 0) {
+        try { $Width = $Host.UI.RawUI.WindowSize.Width } catch { $Width = 120 }
+    }
+    
+    $clean = Strip-Ansi $Line
+    $len = $clean.Length
+    
+    if ($len -lt $Width) {
+        return $Line + (" " * ($Width - $len))
+    }
+    return $Line
+}
+
 function Write-Log {
     param (
         [string]$Message,
@@ -246,14 +302,16 @@ function Get-ProfileColor {
     return "Red"
 }
 
-function global:Show-Header {
-    Clear-Host
-    Write-Host "==========================================" -ForegroundColor Cyan
-    Write-Host "   AWS RDS BLUE/GREEN DEPLOYMENT TOOL     " -ForegroundColor Cyan
+function Get-Header-Lines {
+    $lines = @()
+    
+    $lines += Pad-Line (Get-AnsiString "==========================================" -Color Cyan)
+    $lines += Pad-Line (Get-AnsiString "   AWS RDS BLUE/GREEN DEPLOYMENT TOOL     " -Color Cyan)
+    
     if ($global:AWSProfile) {
         $profileStr = "   PROFILE: $global:AWSProfile (SSO)"
-
-        # Check metadata for warning
+        $line = ""
+        
         if ($global:AWSConfigMetadata -and $global:AWSConfigMetadata.ContainsKey($global:AWSProfile)) {
             $meta = $global:AWSConfigMetadata[$global:AWSProfile]
             if ($meta.Env -or $meta.Type) {
@@ -262,23 +320,36 @@ function global:Show-Header {
                 $warnStr = " [ $envStr / $typeStr ]"
 
                 $warnColor = Get-ProfileColor -ProfileName $global:AWSProfile -Type $typeStr -Env $envStr
-
-                Write-Host $profileStr -NoNewline -ForegroundColor Magenta
-                Write-Host $warnStr -ForegroundColor $warnColor
+                
+                # Combine parts manually to preserve colors in one line
+                $part1 = Get-AnsiString $profileStr -Color Magenta
+                $part2 = Get-AnsiString $warnStr -Color $warnColor
+                $line = "$part1$part2"
             } else {
-                 Write-Host $profileStr -ForegroundColor Magenta
+                 $line = Get-AnsiString $profileStr -Color Magenta
             }
         } else {
-            Write-Host $profileStr -ForegroundColor Magenta
+            $line = Get-AnsiString $profileStr -Color Magenta
         }
+        $lines += Pad-Line $line
     }
     if ($global:SelectedInstance) {
-        Write-Host "   ACTIVE INSTANCE: $($global:SelectedInstance.DBInstanceIdentifier)" -ForegroundColor Green
+        $lines += Pad-Line (Get-AnsiString "   ACTIVE INSTANCE: $($global:SelectedInstance.DBInstanceIdentifier)" -Color Green)
     }
-    Write-Host "==========================================" -ForegroundColor Cyan
+    $lines += Pad-Line (Get-AnsiString "==========================================" -Color Cyan)
+    
+    return $lines
 }
 
-function global:Show-Menu {
+function Show-Header {
+    Clear-Host
+    $lines = Get-Header-Lines
+    foreach ($line in $lines) {
+        [Console]::WriteLine($line)
+    }
+}
+
+function Show-Menu {
     param (
         [string]$Title,
         [object[]]$Options,
@@ -317,27 +388,30 @@ function global:Show-Menu {
 
     $headerLogic = {
         param($SearchString, $TotalItems, $FilteredCount)
-        Show-Header
+        $lines = @(Get-Header-Lines)
         if (![string]::IsNullOrEmpty($capturedTitle)) {
-            Write-Host "$capturedTitle" -ForegroundColor Yellow
-            Write-Host "------------------------------------------"
+            $lines += Get-AnsiString "$capturedTitle" -Color Yellow
+            $lines += "------------------------------------------"
         }
         if ($capturedEnable) {
-            Write-Host "Filter: $SearchString" -ForegroundColor Cyan
-            Write-Host "------------------------------------------"
+            $lines += Get-AnsiString "Filter: $SearchString" -Color Cyan
+            $lines += "------------------------------------------"
         }
+        return $lines
     }.GetNewClosure()
 
     # Footer logic
     $footerLogic = {
         param($MultiSelect)
+        $lines = @()
         if ($MultiSelect) {
-             Write-Host "UP/DOWN: Navigate | SPACE: Select | ENTER: Confirm | Type to Filter" -ForegroundColor DarkGray
+             $lines += Get-AnsiString "UP/DOWN: Navigate | SPACE: Select | ENTER: Confirm | Type to Filter" -Color DarkGray
         } elseif ($capturedEnable) {
-            Write-Host "UP/DOWN: Navigate | ENTER: Select | Type to Filter | ESC: Clear/Back" -ForegroundColor DarkGray
+            $lines += Get-AnsiString "UP/DOWN: Navigate | ENTER: Select | Type to Filter | ESC: Clear/Back" -Color DarkGray
         } else {
-            Write-Host "Use UP/DOWN arrows to navigate, ENTER to select (q/ESC to Back)." -ForegroundColor DarkGray
+            $lines += Get-AnsiString "Use UP/DOWN arrows to navigate, ENTER to select (q/ESC to Back)." -Color DarkGray
         }
+        return $lines
     }.GetNewClosure()
 
     return Invoke-InteractiveViewportSelection -Items $Options `
@@ -366,11 +440,11 @@ function Get-Instance-BG-Role {
     return $null
 }
 
-function global:Invoke-InteractiveViewportSelection {
+function Invoke-InteractiveViewportSelection {
     param (
         [Parameter(Mandatory=$true)] [System.Collections.IList]$Items,
-        [scriptblock]$HeaderContent, # Should accept params ($SearchString, $TotalItems, $FilteredCount)
-        [scriptblock]$FooterContent,
+        [scriptblock]$HeaderContent, # Should return string array
+        [scriptblock]$FooterContent, # Should return string array
         [string[]]$FilterProperties, # If null, filter on ToString or Label
         [switch]$MultiSelect,
         [int]$MaxSelectionCount = 0,
@@ -388,17 +462,17 @@ function global:Invoke-InteractiveViewportSelection {
     # Hide cursor
     try { [Console]::CursorVisible = $false } catch {}
 
+    # Initialize StringBuilder for Double Buffering
+    $sb = [System.Text.StringBuilder]::new()
+
     while ($true) {
         # 1. Filter Data
-        # We need to map filtered items back to original indices if returning index or handling multi-select correctly.
-        # Wrapper object: { OriginalIndex, Item, DisplayLabel }
-
         $wrappedItems = @()
         for ($i = 0; $i -lt $Items.Count; $i++) {
             $item = $Items[$i]
             $label = if ($item -is [string]) { $item }
                      elseif ($item.PSObject.Properties['Label']) { $item.Label }
-                     elseif ($item.DBInstanceIdentifier) { "$($item.DBInstanceIdentifier) ($($item.Engine))" } # Default fallback for RDS logic
+                     elseif ($item.DBInstanceIdentifier) { "$($item.DBInstanceIdentifier) ($($item.Engine))" }
                      else { $item.ToString() }
 
             $match = $true
@@ -428,38 +502,34 @@ function global:Invoke-InteractiveViewportSelection {
 
         # Scroll Logic
         try { $winHeight = $Host.UI.RawUI.WindowSize.Height } catch { $winHeight = 24 }
+        try { $winWidth = $Host.UI.RawUI.WindowSize.Width } catch { $winWidth = 80 }
 
-        # Calculate Header/Footer Height (Estimate or Fixed?)
-        # Let's assume a safe default: Header 7 lines, Footer 3 lines = 10 lines reserved.
         $reservedLines = 12
         $viewportHeight = $winHeight - $reservedLines
         if ($viewportHeight -lt 5) { $viewportHeight = 5 }
 
-        # Adjust WindowStart
         if ($currentIndex -lt $windowStart) {
             $windowStart = $currentIndex
         } elseif ($currentIndex -ge ($windowStart + $viewportHeight)) {
             $windowStart = $currentIndex - $viewportHeight + 1
         }
-
-        # Ensure window doesn't go past end
-        if ($windowStart + $viewportHeight -gt $wrappedItems.Count) {
-             # If we are at the end, but list is short, windowStart is 0.
-             # If list is long, we just show what fits.
-        }
         if ($wrappedItems.Count -lt $viewportHeight) { $windowStart = 0 }
 
-        # 3. Render
-        # Use Clear-Host for now (simplest for overhaul).
-        Clear-Host
+        # 3. Render to Buffer
+        [void]$sb.Clear()
+        try { [Console]::SetCursorPosition(0, 0) } catch {}
 
         # Execute Header ScriptBlock
         if ($HeaderContent) {
-            & $HeaderContent -SearchString $searchString -TotalItems $Items.Count -FilteredCount $wrappedItems.Count
+            $headerLines = & $HeaderContent -SearchString $searchString -TotalItems $Items.Count -FilteredCount $wrappedItems.Count
+            if ($headerLines -is [string]) { $headerLines = @($headerLines) }
+            foreach ($l in $headerLines) {
+                [void]$sb.AppendLine((Pad-Line $l $winWidth))
+            }
         } else {
-            Write-Host "--- Select Item ---" -ForegroundColor Cyan
-            Write-Host "Filter: $searchString" -ForegroundColor Yellow
-            Write-Host "----------------------------------------"
+            [void]$sb.AppendLine((Pad-Line (Get-AnsiString "--- Select Item ---" -Color Cyan) $winWidth))
+            [void]$sb.AppendLine((Pad-Line (Get-AnsiString "Filter: $searchString" -Color Yellow) $winWidth))
+            [void]$sb.AppendLine((Pad-Line "----------------------------------------" $winWidth))
         }
 
         # Render Viewport
@@ -467,7 +537,7 @@ function global:Invoke-InteractiveViewportSelection {
         if ($endRow -ge $wrappedItems.Count) { $endRow = $wrappedItems.Count - 1 }
 
         if ($wrappedItems.Count -eq 0) {
-            Write-Host "   (No matches)" -ForegroundColor DarkGray
+            [void]$sb.AppendLine((Pad-Line (Get-AnsiString "   (No matches)" -Color DarkGray) $winWidth))
         } else {
             for ($i = $windowStart; $i -le $endRow; $i++) {
                 $wItem = $wrappedItems[$i]
@@ -480,46 +550,71 @@ function global:Invoke-InteractiveViewportSelection {
                     if ($isHighlighted) { "-> " } else { "   " }
                 }
 
-                $line = "$prefix$($wItem.Label)"
+                $rawLabel = "$prefix$($wItem.Label)"
+                if ($rawLabel.Length -gt $winWidth) {
+                    $rawLabel = $rawLabel.Substring(0, $winWidth - 1)
+                }
 
                 # Colors
                 $fg = "Gray"
-                $bg = "Black"
-
                 if ($wItem.Color) { $fg = $wItem.Color }
 
                 if ($isHighlighted) {
-                    $fg = "Cyan"
-                    $bg = "DarkGray"
+                    # Cyan FG on DarkGray (Bright Black) BG
+                    $fgCode = "$($global:ESC)[36m"
+                    $bgCode = "$($global:ESC)[100m"
+                    $lineAnsi = "$fgCode$bgCode$rawLabel$($global:ANSI.Reset)"
                 } elseif ($isSelected) {
                     $fg = "Green"
+                    $lineAnsi = Get-AnsiString $rawLabel -Color $fg
+                } else {
+                    $lineAnsi = Get-AnsiString $rawLabel -Color $fg
                 }
 
-                Write-Host $line -ForegroundColor $fg -BackgroundColor $bg
+                [void]$sb.AppendLine((Pad-Line $lineAnsi $winWidth))
             }
         }
 
-        # Fill remaining viewport lines to maintain footer position (Optional, but good for frozen effect)
+        # Fill remaining lines
         $linesPrinted = if ($wrappedItems.Count -gt 0) { $endRow - $windowStart + 1 } else { 1 }
         $remaining = $viewportHeight - $linesPrinted
         if ($remaining -gt 0) {
-            for ($k = 0; $k -lt $remaining; $k++) { Write-Host "" }
-        }
-
-        Write-Host "----------------------------------------" -ForegroundColor DarkGray
-        # Execute Footer ScriptBlock
-        if ($FooterContent) {
-            & $FooterContent -MultiSelect $MultiSelect
-        } else {
-            if ($MultiSelect) {
-                Write-Host "UP/DOWN: Navigate | SPACE: Toggle | ENTER: Confirm | Type to Filter" -ForegroundColor Gray
-            } else {
-                Write-Host "UP/DOWN: Navigate | ENTER: Select | Type to Filter | ESC: Cancel" -ForegroundColor Gray
+            for ($k = 0; $k -lt $remaining; $k++) { 
+                [void]$sb.AppendLine((Pad-Line "" $winWidth))
             }
         }
 
-        # 4. Input Handling
-        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        [void]$sb.AppendLine((Pad-Line (Get-AnsiString "----------------------------------------" -Color DarkGray) $winWidth))
+        
+        # Execute Footer ScriptBlock
+        if ($FooterContent) {
+            $footerLines = & $FooterContent -MultiSelect $MultiSelect
+            if ($footerLines -is [string]) { $footerLines = @($footerLines) }
+            foreach ($l in $footerLines) {
+                [void]$sb.AppendLine((Pad-Line $l $winWidth))
+            }
+        } else {
+            if ($MultiSelect) {
+                [void]$sb.AppendLine((Pad-Line (Get-AnsiString "UP/DOWN: Navigate | SPACE: Toggle | ENTER: Confirm | Type to Filter" -Color Gray) $winWidth))
+            } else {
+                [void]$sb.AppendLine((Pad-Line (Get-AnsiString "UP/DOWN: Navigate | ENTER: Select | Type to Filter | ESC: Cancel" -Color Gray) $winWidth))
+            }
+        }
+
+        # 4. Flush and Write Buffer
+        try { [Console]::Write($sb.ToString()) } catch {}
+
+        # 5. Input Handling Loop
+        while (-not [Console]::KeyAvailable) {
+            Start-Sleep -Milliseconds 20
+        }
+        
+        try {
+            $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        } catch {
+            Start-Sleep -Seconds 1
+            return -1
+        }
 
         switch ($key.VirtualKeyCode) {
             27 { # Escape
@@ -530,7 +625,7 @@ function global:Invoke-InteractiveViewportSelection {
                 try { [Console]::CursorVisible = $true } catch {}
                 if ($MultiSelect) {
                     $res = @($selectedIndices)
-                    return ,$res # Return array of indices
+                    return ,$res 
                 } else {
                     if ($wrappedItems.Count -gt 0) {
                         $sel = $wrappedItems[$currentIndex]
@@ -559,11 +654,11 @@ function global:Invoke-InteractiveViewportSelection {
             }
             38 { # Up
                 if ($currentIndex -gt 0) { $currentIndex-- }
-                elseif ($currentIndex -eq 0 -and $wrappedItems.Count -gt 0) { $currentIndex = $wrappedItems.Count - 1 } # Wrap
+                elseif ($currentIndex -eq 0 -and $wrappedItems.Count -gt 0) { $currentIndex = $wrappedItems.Count - 1 }
             }
             40 { # Down
                 if ($currentIndex -lt $wrappedItems.Count - 1) { $currentIndex++ }
-                elseif ($currentIndex -eq $wrappedItems.Count - 1) { $currentIndex = 0 } # Wrap
+                elseif ($currentIndex -eq $wrappedItems.Count - 1) { $currentIndex = 0 }
             }
             8 { # Backspace
                 if ($searchString.Length -gt 0) {
@@ -573,7 +668,6 @@ function global:Invoke-InteractiveViewportSelection {
                 }
             }
             112 { # F1
-                 # Special handling for main menu restart
                  if ($ReturnIndex) {
                      $global:RestartSessionSelection = $true
                      return -99
@@ -586,7 +680,6 @@ function global:Invoke-InteractiveViewportSelection {
                     $currentIndex = 0
                     $windowStart = 0
                 } else {
-                    # Handle 'q' for quit if filter empty
                     if ($searchString.Length -eq 0 -and $char -eq 'q') {
                         try { [Console]::CursorVisible = $true } catch {}
                         if ($ReturnIndex) { return -1 } else { return $null }
@@ -607,11 +700,12 @@ function Select-RDSInstance-Live {
 
     $header = {
         param($SearchString, $TotalItems, $FilteredCount)
-        Show-Header
-        Write-Host "$Title" -ForegroundColor Cyan
-        Write-Host "Search filter: $SearchString_" -ForegroundColor Yellow
-        Write-Host "Showing $FilteredCount / $TotalItems items" -ForegroundColor DarkGray
-        Write-Host "--------------------------------------------------" -ForegroundColor DarkGray
+        $lines = @(Get-Header-Lines)
+        $lines += Get-AnsiString "$Title" -Color Cyan
+        $lines += Get-AnsiString "Search filter: $SearchString_" -Color Yellow
+        $lines += Get-AnsiString "Showing $FilteredCount / $TotalItems items" -Color DarkGray
+        $lines += Get-AnsiString "--------------------------------------------------" -Color DarkGray
+        return $lines
     }.GetNewClosure()
 
     return Invoke-InteractiveViewportSelection -Items $Instances -HeaderContent $header -FilterProperties @("DBInstanceIdentifier", "Engine")
@@ -2298,17 +2392,18 @@ function Remove-RDSSnapshot-Interactive {
         # Define headers for Viewport Engine
         $header = {
             param($SearchString, $TotalItems, $FilteredCount)
-            Show-Header
-            Write-Host "DELETE SNAPSHOTS (Manual)" -ForegroundColor Red
-            Write-Host "------------------------------------------"
-            Write-Host "Filter: $SearchString" -ForegroundColor Yellow
-            Write-Host "Showing $FilteredCount / $TotalItems snapshots" -ForegroundColor DarkGray
-            Write-Host "------------------------------------------"
+            $lines = @(Get-Header-Lines)
+            $lines += Get-AnsiString "DELETE SNAPSHOTS (Manual)" -Color Red
+            $lines += "------------------------------------------"
+            $lines += Get-AnsiString "Filter: $SearchString" -Color Yellow
+            $lines += Get-AnsiString "Showing $FilteredCount / $TotalItems snapshots" -Color DarkGray
+            $lines += "------------------------------------------"
+            return $lines
         }.GetNewClosure()
 
         $footer = {
             param($MultiSelect)
-            Write-Host "SPACE: Toggle Selection | ENTER: Confirm | Type to Filter" -ForegroundColor DarkGray
+            return @(Get-AnsiString "SPACE: Toggle Selection | ENTER: Confirm | Type to Filter" -Color DarkGray)
         }.GetNewClosure()
 
         # Call Viewport Engine
