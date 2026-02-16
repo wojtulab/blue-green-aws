@@ -38,7 +38,9 @@ A comprehensive PowerShell-based interactive CLI tool for managing AWS RDS Blue/
 
 1. Clone the repository or download `rds_bg_manager.ps1`.
 2. Ensure you have `rds_bg_manager.config.ps1` in the same directory (created automatically if missing on first run, though usually distributed with the script).
-3. Open PowerShell terminal.
+3. Unblock script.
+4. Install powershell 7
+5. Connect .ps1 extension with powershell7 to open it directly.
 
 ## Configuration
 
