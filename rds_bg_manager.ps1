@@ -1,4 +1,4 @@
-# VERSION: 2026.02.10.15
+# VERSION: 2026.02.12.05
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,15 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-02-12
+    - Refactored 'Delete Snapshots' to use the new viewport engine, allowing search, multi-selection, and bulk deletion of all manual snapshots (removed 50-item limit).
+    - Added 'Pre-flight Snapshot Quota Check' for single and multiple snapshot workflows. 
+      The tool now verifies if the 100 manual snapshot limit is reached before attempting creation, allowing users to retry after cleanup.
+    
+    2026-02-11
+    - Maintenance Release: Verified stability of recent safety patches.
+    - Documentation Update: Refined internal documentation strings.
+
     2026-02-10
     - Enhanced 'Apply Pending Maintenance': The confirmation prompt ("Apply Immediately?") is now a cancellable menu supporting 'q' and 'ESC' to exit safely at any time.
     - Updated Show-Menu to support 'q' key for cancellation when filtering is disabled.
@@ -277,181 +286,66 @@ function Show-Menu {
         [switch]$MultiSelect,
         [int]$MaxSelectionCount = 0
     )
-    
-    $selection = 0
-    $filter = ""
-    $multiSelectedIndices = New-Object System.Collections.Generic.HashSet[int]
-    
-    # Hide cursor
-    try { [Console]::CursorVisible = $false } catch {}
 
-    while ($true) {
+    # Bridge Show-Menu to Invoke-InteractiveViewportSelection
+    # Since Show-Menu returns Index (or Indices), we use -ReturnIndex switch.
+
+    $header = {
+        param($SearchString, $TotalItems, $FilteredCount)
         Show-Header
         if (![string]::IsNullOrEmpty($Title)) {
             Write-Host "$Title" -ForegroundColor Yellow
             Write-Host "------------------------------------------"
         }
-
-        # Filter options
-        if ($EnableFilter -and ![string]::IsNullOrEmpty($filter)) {
-            $filteredOptions = $Options | Where-Object { 
-                $lbl = if ($_ -is [string]) { $_ } else { $_.Label }
-                $lbl -like "*$filter*" 
-            }
-            $displayOptions = @($filteredOptions)
-            
-            Write-Host "Filter: $filter" -ForegroundColor Cyan
+        
+        if ($EnableFilter) {
+            Write-Host "Filter: $SearchString" -ForegroundColor Cyan
             Write-Host "------------------------------------------"
-        } else {
-            $displayOptions = $Options
-            if ($EnableFilter) {
-                Write-Host "Type to filter..." -ForegroundColor DarkGray
-                Write-Host "------------------------------------------"
-            }
-        }
-
-        # Handle empty filtered list
-        if ($displayOptions.Count -eq 0) {
-            Write-Host "No matches found." -ForegroundColor Red
-        } else {
-            # Adjust selection index if out of bounds after filter change
-            if ($selection -ge $displayOptions.Count) { $selection = $displayOptions.Count - 1 }
-            if ($selection -lt 0) { $selection = 0 }
-            
-            for ($i = 0; $i -lt $displayOptions.Count; $i++) {
-                $item = $displayOptions[$i]
-                $originalIndex = $Options.IndexOf($item)
-
-                $label = if ($item -is [string]) { $item } else { $item.Label }
-                $color = if ($item.PSObject.Properties['Color'] -and $item.Color) { $item.Color } else { "Gray" }
-
-                $prefix = "   "
-                if ($MultiSelect) {
-                    $mark = if ($multiSelectedIndices.Contains($originalIndex)) { "[*]" } else { "[ ]" }
-                    if ($i -eq $selection) {
-                        Write-Host "$mark $label" -ForegroundColor Black -BackgroundColor White
-                    } else {
-                        Write-Host "$mark $label" -ForegroundColor $color
-                    }
-                } else {
-                    if ($i -eq $selection) {
-                        Write-Host "-> $label" -ForegroundColor Black -BackgroundColor White
-                    } else {
-                        Write-Host "   $label" -ForegroundColor $color
-                    }
-                }
-            }
-        }
-        
-        Write-Host "------------------------------------------"
-        if ($MultiSelect) {
-             Write-Host "UP/DOWN: Navigate | SPACE: Select | ENTER: Confirm | Type to Filter" -ForegroundColor DarkGray
-        } elseif ($EnableFilter) {
-            Write-Host "UP/DOWN: Navigate | ENTER: Select | Type to Filter | ESC: Clear/Back" -ForegroundColor DarkGray
-        } else {
-            Write-Host "Use UP/DOWN arrows to navigate, ENTER to select." -ForegroundColor DarkGray
-        }
-
-        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-        
-        switch ($key.VirtualKeyCode) {
-            112 { # F1
-                try { [Console]::CursorVisible = $true } catch {}
-                $global:RestartSessionSelection = $true
-                return -99
-            }
-            38 { # Up Arrow
-                if ($displayOptions.Count -gt 0) {
-                    $selection--
-                    if ($selection -lt 0) { $selection = $displayOptions.Count - 1 }
-                    
-                    # Skip separators
-                    while ($displayOptions[$selection] -match '^-+$') {
-                        $selection--
-                        if ($selection -lt 0) { $selection = $displayOptions.Count - 1 }
-                    }
-                }
-            }
-            40 { # Down Arrow
-                if ($displayOptions.Count -gt 0) {
-                    $selection++
-                    if ($selection -ge $displayOptions.Count) { $selection = 0 }
-
-                    # Skip separators
-                    while ($displayOptions[$selection] -match '^-+$') {
-                        $selection++
-                        if ($selection -ge $displayOptions.Count) { $selection = 0 }
-                    }
-                }
-            }
-            32 { # Space
-                if ($MultiSelect -and $displayOptions.Count -gt 0) {
-                     $item = $displayOptions[$selection]
-                     $originalIndex = $Options.IndexOf($item)
-                     if ($multiSelectedIndices.Contains($originalIndex)) {
-                         $multiSelectedIndices.Remove($originalIndex) | Out-Null
-                     } else {
-                         if ($MaxSelectionCount -gt 0 -and $multiSelectedIndices.Count -ge $MaxSelectionCount) {
-                             if ($MaxSelectionCount -eq 1) {
-                                 $multiSelectedIndices.Clear()
-                                 $multiSelectedIndices.Add($originalIndex) | Out-Null
-                             }
-                         } else {
-                             $multiSelectedIndices.Add($originalIndex) | Out-Null
-                         }
-                     }
-                }
-            }
-            13 { # Enter
-                if ($displayOptions.Count -gt 0) {
-                    try { [Console]::CursorVisible = $true } catch {}
-                    
-                    if ($MultiSelect) {
-                        # Return array of selected ORIGINAL indices
-                        # If nothing selected but user pressed Enter, maybe select current?
-                        # Usually standard is: Enter confirms selection set.
-                        # We force an array return using ,@() to avoid scalar unrolling
-                        $result = @($multiSelectedIndices)
-                        return ,$result
-                    } else {
-                        $selectedItem = $displayOptions[$selection]
-                        $originalIndex = $Options.IndexOf($selectedItem)
-                        return $originalIndex
-                    }
-                }
-            }
-            8 { # Backspace
-                if ($EnableFilter -and $filter.Length -gt 0) {
-                    $filter = $filter.Substring(0, $filter.Length - 1)
-                    $selection = 0
-                }
-            }
-            27 { # Esc
-                 if ($EnableFilter -and $filter.Length -gt 0) {
-                     $filter = ""
-                     $selection = 0
-                 } else {
-                     try { [Console]::CursorVisible = $true } catch {}
-                     return -1 
-                 }
-            }
-            Default {
-                if ($EnableFilter) {
-                    $char = $key.Character
-                    if (![char]::IsControl($char)) {
-                        $filter += $char
-                        $selection = 0
-                    }
-                } else {
-                    # Allow 'q' to quit if filter is disabled
-                    if ($key.Character -eq 'q') {
-                        try { [Console]::CursorVisible = $true } catch {}
-                        return -1
-                    }
-                }
-            }
         }
     }
+    
+    # Pass title via closure or construct logic above.
+    # Note: Closures in PowerShell need .GetNewClosure() or reliance on scope.
+    # Here, $Title and $EnableFilter are accessible in the scope if defined, but scriptblock execution scope varies.
+    # Invoke-InteractiveViewportSelection executes it.
+    # To be safe, we can use the param block in scriptblock and pass arguments if the function supports it,
+    # OR rely on the fact that we define the scriptblock here.
+    
+    # We need to make sure $Title is captured.
+    $capturedTitle = $Title
+    $capturedEnable = $EnableFilter
+    
+    $headerLogic = {
+        param($SearchString, $TotalItems, $FilteredCount)
+        Show-Header
+        if (![string]::IsNullOrEmpty($capturedTitle)) {
+            Write-Host "$capturedTitle" -ForegroundColor Yellow
+            Write-Host "------------------------------------------"
+        }
+        if ($capturedEnable) {
+            Write-Host "Filter: $SearchString" -ForegroundColor Cyan
+            Write-Host "------------------------------------------"
+        }
+    }.GetNewClosure()
+
+    # Footer logic
+    $footerLogic = {
+        param($MultiSelect)
+        if ($MultiSelect) {
+             Write-Host "UP/DOWN: Navigate | SPACE: Select | ENTER: Confirm | Type to Filter" -ForegroundColor DarkGray
+        } elseif ($capturedEnable) {
+            Write-Host "UP/DOWN: Navigate | ENTER: Select | Type to Filter | ESC: Clear/Back" -ForegroundColor DarkGray
+        } else {
+            Write-Host "Use UP/DOWN arrows to navigate, ENTER to select (q/ESC to Back)." -ForegroundColor DarkGray
+        }
+    }.GetNewClosure()
+
+    return Invoke-InteractiveViewportSelection -Items $Options `
+        -HeaderContent $headerLogic `
+        -FooterContent $footerLogic `
+        -MultiSelect:$MultiSelect `
+        -MaxSelectionCount $MaxSelectionCount `
+        -ReturnIndex
 }
 
 function Get-Instance-BG-Role {
@@ -470,6 +364,257 @@ function Get-Instance-BG-Role {
         if ($bg.Target -match ":db:$InstanceIdentifier$") { return "Green (Target)" }
     }
     return $null
+}
+
+function Invoke-InteractiveViewportSelection {
+    param (
+        [Parameter(Mandatory=$true)] [System.Collections.IList]$Items,
+        [scriptblock]$HeaderContent, # Should accept params ($SearchString, $TotalItems, $FilteredCount)
+        [scriptblock]$FooterContent,
+        [string[]]$FilterProperties, # If null, filter on ToString or Label
+        [switch]$MultiSelect,
+        [int]$MaxSelectionCount = 0,
+        [switch]$ReturnIndex
+    )
+
+    # Initialize State
+    $searchString = ""
+    $currentIndex = 0
+    $windowStart = 0
+    
+    # Store indices of selected items (Hash Set for O(1) lookup)
+    $selectedIndices = New-Object System.Collections.Generic.HashSet[int]
+
+    # Hide cursor
+    try { [Console]::CursorVisible = $false } catch {}
+
+    while ($true) {
+        # 1. Filter Data
+        # We need to map filtered items back to original indices if returning index or handling multi-select correctly.
+        # Wrapper object: { OriginalIndex, Item, DisplayLabel }
+        
+        $wrappedItems = @()
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            $item = $Items[$i]
+            $label = if ($item -is [string]) { $item } 
+                     elseif ($item.PSObject.Properties['Label']) { $item.Label }
+                     elseif ($item.DBInstanceIdentifier) { "$($item.DBInstanceIdentifier) ($($item.Engine))" } # Default fallback for RDS logic
+                     else { $item.ToString() }
+            
+            $match = $true
+            if (![string]::IsNullOrEmpty($searchString)) {
+                if ($FilterProperties) {
+                    $match = $false
+                    foreach ($prop in $FilterProperties) {
+                        if ($item.$prop -like "*$searchString*") { $match = $true; break }
+                    }
+                } else {
+                    if ($label -notlike "*$searchString*") { $match = $false }
+                }
+            }
+            
+            if ($match) {
+                $wrappedItems += [PSCustomObject]@{ OriginalIndex = $i; Item = $item; Label = $label; Color = $item.Color }
+            }
+        }
+        
+        # 2. Boundary Checks
+        if ($wrappedItems.Count -eq 0) {
+            $currentIndex = 0
+        } elseif ($currentIndex -ge $wrappedItems.Count) {
+            $currentIndex = $wrappedItems.Count - 1
+        }
+        if ($currentIndex -lt 0) { $currentIndex = 0 }
+
+        # Scroll Logic
+        try { $winHeight = $Host.UI.RawUI.WindowSize.Height } catch { $winHeight = 24 }
+        
+        # Calculate Header/Footer Height (Estimate or Fixed?)
+        # Let's assume a safe default: Header 7 lines, Footer 3 lines = 10 lines reserved.
+        $reservedLines = 12
+        $viewportHeight = $winHeight - $reservedLines
+        if ($viewportHeight -lt 5) { $viewportHeight = 5 }
+
+        # Adjust WindowStart
+        if ($currentIndex -lt $windowStart) {
+            $windowStart = $currentIndex
+        } elseif ($currentIndex -ge ($windowStart + $viewportHeight)) {
+            $windowStart = $currentIndex - $viewportHeight + 1
+        }
+        
+        # Ensure window doesn't go past end
+        if ($windowStart + $viewportHeight -gt $wrappedItems.Count) {
+             # If we are at the end, but list is short, windowStart is 0.
+             # If list is long, we just show what fits.
+        }
+        if ($wrappedItems.Count -lt $viewportHeight) { $windowStart = 0 }
+
+        # 3. Render
+        # Use Clear-Host for now (simplest for overhaul).
+        Clear-Host
+        
+        # Execute Header ScriptBlock
+        if ($HeaderContent) {
+            & $HeaderContent -SearchString $searchString -TotalItems $Items.Count -FilteredCount $wrappedItems.Count
+        } else {
+            Write-Host "--- Select Item ---" -ForegroundColor Cyan
+            Write-Host "Filter: $searchString" -ForegroundColor Yellow
+            Write-Host "----------------------------------------"
+        }
+
+        # Render Viewport
+        $endRow = $windowStart + $viewportHeight - 1
+        if ($endRow -ge $wrappedItems.Count) { $endRow = $wrappedItems.Count - 1 }
+
+        if ($wrappedItems.Count -eq 0) {
+            Write-Host "   (No matches)" -ForegroundColor DarkGray
+        } else {
+            for ($i = $windowStart; $i -le $endRow; $i++) {
+                $wItem = $wrappedItems[$i]
+                $isHighlighted = ($i -eq $currentIndex)
+                $isSelected = $selectedIndices.Contains($wItem.OriginalIndex)
+                
+                $prefix = if ($MultiSelect) {
+                    if ($isSelected) { "[*] " } else { "[ ] " }
+                } else {
+                    if ($isHighlighted) { "-> " } else { "   " }
+                }
+                
+                $line = "$prefix$($wItem.Label)"
+                
+                # Colors
+                $fg = "Gray"
+                $bg = "Black"
+                
+                if ($wItem.Color) { $fg = $wItem.Color }
+                
+                if ($isHighlighted) {
+                    $fg = "Cyan"
+                    $bg = "DarkGray"
+                } elseif ($isSelected) {
+                    $fg = "Green"
+                }
+                
+                Write-Host $line -ForegroundColor $fg -BackgroundColor $bg
+            }
+        }
+        
+        # Fill remaining viewport lines to maintain footer position (Optional, but good for frozen effect)
+        $linesPrinted = if ($wrappedItems.Count -gt 0) { $endRow - $windowStart + 1 } else { 1 }
+        $remaining = $viewportHeight - $linesPrinted
+        if ($remaining -gt 0) {
+            for ($k = 0; $k -lt $remaining; $k++) { Write-Host "" }
+        }
+
+        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+        # Execute Footer ScriptBlock
+        if ($FooterContent) {
+            & $FooterContent -MultiSelect $MultiSelect
+        } else {
+            if ($MultiSelect) {
+                Write-Host "UP/DOWN: Navigate | SPACE: Toggle | ENTER: Confirm | Type to Filter" -ForegroundColor Gray
+            } else {
+                Write-Host "UP/DOWN: Navigate | ENTER: Select | Type to Filter | ESC: Cancel" -ForegroundColor Gray
+            }
+        }
+
+        # 4. Input Handling
+        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        
+        switch ($key.VirtualKeyCode) {
+            27 { # Escape
+                try { [Console]::CursorVisible = $true } catch {}
+                if ($ReturnIndex) { return -1 } else { return $null }
+            }
+            13 { # Enter
+                try { [Console]::CursorVisible = $true } catch {}
+                if ($MultiSelect) {
+                    $res = @($selectedIndices)
+                    return ,$res # Return array of indices
+                } else {
+                    if ($wrappedItems.Count -gt 0) {
+                        $sel = $wrappedItems[$currentIndex]
+                        if ($ReturnIndex) { return $sel.OriginalIndex }
+                        else { return $sel.Item }
+                    }
+                }
+            }
+            32 { # Space
+                if ($MultiSelect -and $wrappedItems.Count -gt 0) {
+                    $sel = $wrappedItems[$currentIndex]
+                    $oid = $sel.OriginalIndex
+                    if ($selectedIndices.Contains($oid)) {
+                        $selectedIndices.Remove($oid) | Out-Null
+                    } else {
+                        if ($MaxSelectionCount -gt 0 -and $selectedIndices.Count -ge $MaxSelectionCount) {
+                            if ($MaxSelectionCount -eq 1) {
+                                $selectedIndices.Clear()
+                                $selectedIndices.Add($oid) | Out-Null
+                            }
+                        } else {
+                            $selectedIndices.Add($oid) | Out-Null
+                        }
+                    }
+                }
+            }
+            38 { # Up
+                if ($currentIndex -gt 0) { $currentIndex-- }
+                elseif ($currentIndex -eq 0 -and $wrappedItems.Count -gt 0) { $currentIndex = $wrappedItems.Count - 1 } # Wrap
+            }
+            40 { # Down
+                if ($currentIndex -lt $wrappedItems.Count - 1) { $currentIndex++ }
+                elseif ($currentIndex -eq $wrappedItems.Count - 1) { $currentIndex = 0 } # Wrap
+            }
+            8 { # Backspace
+                if ($searchString.Length -gt 0) {
+                    $searchString = $searchString.Substring(0, $searchString.Length - 1)
+                    $currentIndex = 0
+                    $windowStart = 0
+                }
+            }
+            112 { # F1
+                 # Special handling for main menu restart
+                 if ($ReturnIndex) { 
+                     $global:RestartSessionSelection = $true
+                     return -99 
+                 }
+            }
+            Default {
+                $char = $key.Character
+                if (![char]::IsControl($char)) {
+                    $searchString += $char
+                    $currentIndex = 0
+                    $windowStart = 0
+                } else {
+                    # Handle 'q' for quit if filter empty
+                    if ($searchString.Length -eq 0 -and $char -eq 'q') {
+                        try { [Console]::CursorVisible = $true } catch {}
+                        if ($ReturnIndex) { return -1 } else { return $null }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Select-RDSInstance-Live {
+    # Wrapper for legacy/specific calls using the new engine
+    param (
+        [array]$Instances,
+        [string]$Title = "Select Instance"
+    )
+    if (!$Instances) { return $null }
+
+    $header = {
+        param($SearchString, $TotalItems, $FilteredCount)
+        Show-Header
+        Write-Host "$Title" -ForegroundColor Cyan
+        Write-Host "Search filter: $SearchString_" -ForegroundColor Yellow
+        Write-Host "Showing $FilteredCount / $TotalItems items" -ForegroundColor DarkGray
+        Write-Host "--------------------------------------------------" -ForegroundColor DarkGray
+    }.GetNewClosure()
+
+    return Invoke-InteractiveViewportSelection -Items $Instances -HeaderContent $header -FilterProperties @("DBInstanceIdentifier", "Engine")
 }
 
 function Check-SSOSession {
@@ -1304,6 +1449,29 @@ function Get-BlueGreenDeployments {
     }
 }
 
+function Get-ManualSnapshotCount {
+    <#
+    .DESCRIPTION
+    Returns the count of manual DB snapshots (Quota Check).
+    #>
+    Write-Log "Checking manual snapshot quota..." -ForegroundColor Cyan
+    try {
+        # Using --query "length(DBSnapshots)" to get count directly from server side
+        $argsList = @("rds", "describe-db-snapshots", "--snapshot-type", "manual", "--query", "length(DBSnapshots)", "--output", "text", "--profile", $global:AWSProfile)
+        
+        # We don't use -ReturnJson because we want raw text
+        $output = Invoke-AWS-WithRetry -Arguments $argsList
+        
+        $countStr = $output | Out-String
+        if ([string]::IsNullOrWhiteSpace($countStr)) { return 0 }
+        
+        return [int]($countStr.Trim())
+    } catch {
+        Write-Log "Error checking snapshot count: $_" -ForegroundColor Red
+        return 999 # Fail safe (assume full)
+    }
+}
+
 # --- REPORTS FUNCTIONS ---
 
 function Show-Instance-Details {
@@ -1943,27 +2111,68 @@ function New-RDSSnapshot-Interactive {
     }
 
     $selectedID = $global:SelectedInstance.DBInstanceIdentifier
+    
+    # --- QUOTA CHECK ---
+    $maxManualSnapshots = 100
+    $requiredSlots = 1
+    
+    while ($true) {
+        $currentCount = Get-ManualSnapshotCount
+        
+        if (($currentCount + $requiredSlots) -le $maxManualSnapshots) {
+            Write-Log "Quota Check Passed: $currentCount manual snapshots used. Slots available." -ForegroundColor Green
+            break
+        } else {
+            Write-Host "WARNING: AWS Quota Limit Reached!" -ForegroundColor Red
+            Write-Host "You have $currentCount manual snapshots (Limit: $maxManualSnapshots). You need $requiredSlots slot(s)." -ForegroundColor Yellow
+            
+            $resp = Read-Host "Please delete old snapshots manually. Press ENTER to re-check, or type 'Q' to quit"
+            if ($resp -eq 'Q' -or $resp -eq 'q') {
+                return
+            }
+        }
+    }
+    # -------------------
+
     Write-Host "Creating snapshot for active instance: $selectedID" -ForegroundColor Green
 
     $defaultSnapName = "$selectedID-pre-bg-$(Get-TimeStamp)"
+
+    # Ask for optional suffix (ticket number)
+    $usrSuffix = Read-Host "Do you want to add a ticket number/suffix to the snapshot name? (Leave blank for default)"
+    if (![string]::IsNullOrWhiteSpace($usrSuffix)) {
+        $defaultSnapName = "$defaultSnapName-$usrSuffix"
+    }
 
     Write-Host "`nDefault Snapshot Name: $defaultSnapName" -ForegroundColor Gray
     $inputName = Read-Host "Enter snapshot name [Press Enter for default]"
     
     $snapName = if ([string]::IsNullOrWhiteSpace($inputName)) { $defaultSnapName } else { $inputName }
 
-    Write-Log "`nCreating snapshot '$snapName'..." -ForegroundColor Green
-    try {
-        aws rds create-db-snapshot --db-instance-identifier $selectedID --db-snapshot-identifier $snapName --profile $global:AWSProfile | Out-Null
-        Write-Log "Success! Snapshot creation initiated in background." -ForegroundColor Cyan
-        
-        $monitor = Read-Host "Do you want to monitor progress? (Y/n)"
-        if ($monitor -ne "n") {
-            Monitor-Snapshot-Progress
+    $retry = $true
+    while ($retry) {
+        Write-Log "`nCreating snapshot '$snapName'..." -ForegroundColor Green
+        try {
+            aws rds create-db-snapshot --db-instance-identifier $selectedID --db-snapshot-identifier $snapName --profile $global:AWSProfile | Out-Null
+            Write-Log "Success! Snapshot creation initiated in background." -ForegroundColor Cyan
+            
+            $retry = $false # Success, exit retry loop
+            
+            $monitor = Read-Host "Do you want to monitor progress? (Y/n)"
+            if ($monitor -ne "n") {
+                Monitor-Snapshot-Progress
+            }
+        } catch {
+            Write-Log "Failed to create snapshot: $_" -ForegroundColor Red
+            
+            $retryChoice = Read-Host "An error occurred. Do you want to retry the snapshot creation? (y to retry, n to return to main menu)"
+            if ($retryChoice -ne 'y') {
+                $retry = $false
+                Read-Host "Press Enter to menu..."
+            } else {
+                Write-Host "Retrying..." -ForegroundColor Yellow
+            }
         }
-    } catch {
-        Write-Log "Failed to create snapshot: $_" -ForegroundColor Red
-        Read-Host "Press Enter to menu..."
     }
 }
 
@@ -1990,6 +2199,28 @@ function New-MultipleRDSSnapshots-Interactive {
         return
     }
 
+    # --- QUOTA CHECK ---
+    $maxManualSnapshots = 100
+    $requiredSlots = $selectedIndices.Count
+    
+    while ($true) {
+        $currentCount = Get-ManualSnapshotCount
+        
+        if (($currentCount + $requiredSlots) -le $maxManualSnapshots) {
+             Write-Log "Quota Check Passed: $currentCount used + $requiredSlots required <= $maxManualSnapshots Limit." -ForegroundColor Green
+             break
+        } else {
+             Write-Host "WARNING: AWS Quota Limit Reached!" -ForegroundColor Red
+             Write-Host "You have $currentCount manual snapshots (Limit: $maxManualSnapshots). You need $requiredSlots slot(s)." -ForegroundColor Yellow
+             
+             $resp = Read-Host "Please delete old snapshots manually. Press ENTER to re-check, or type 'Q' to quit"
+             if ($resp -eq 'Q' -or $resp -eq 'q') {
+                 return
+             }
+        }
+    }
+    # -------------------
+
     Show-Header
     Write-Host "SELECTED INSTANCES FOR SNAPSHOT:" -ForegroundColor Green
     foreach ($idx in $selectedIndices) {
@@ -1997,7 +2228,12 @@ function New-MultipleRDSSnapshots-Interactive {
     }
 
     $defaultPrefix = "multisnap-$(Get-TimeStamp)"
-    Write-Host "`nDefault Snapshot Name Pattern: $defaultPrefix-{DBInstanceIdentifier}" -ForegroundColor Gray
+    
+    # Ask for optional suffix (ticket number)
+    $usrSuffix = Read-Host "Do you want to add a ticket number/suffix to the snapshot names? (Leave blank for default)"
+    
+    $displayFormat = if (![string]::IsNullOrWhiteSpace($usrSuffix)) { "$defaultPrefix-{DBInstanceIdentifier}-$usrSuffix" } else { "$defaultPrefix-{DBInstanceIdentifier}" }
+    Write-Host "`nSnapshot Name Pattern: $displayFormat" -ForegroundColor Gray
 
     $confirm = Read-Host "Press Enter to execute, or type 'cancel'"
     if ($confirm -eq "cancel") { return }
@@ -2006,13 +2242,26 @@ function New-MultipleRDSSnapshots-Interactive {
     foreach ($idx in $selectedIndices) {
         $inst = $instances[$idx]
         $snapName = "$defaultPrefix-$($inst.DBInstanceIdentifier)"
+        if (![string]::IsNullOrWhiteSpace($usrSuffix)) {
+            $snapName = "$snapName-$usrSuffix"
+        }
 
-        Write-Host "Creating snapshot '$snapName'..." -ForegroundColor Cyan
-        try {
-             aws rds create-db-snapshot --db-instance-identifier $inst.DBInstanceIdentifier --db-snapshot-identifier $snapName --profile $global:AWSProfile | Out-Null
-             Write-Host "OK" -ForegroundColor Green
-        } catch {
-             Write-Host "FAILED: $_" -ForegroundColor Red
+        $retry = $true
+        while ($retry) {
+            Write-Host "Creating snapshot '$snapName'..." -ForegroundColor Cyan
+            try {
+                 aws rds create-db-snapshot --db-instance-identifier $inst.DBInstanceIdentifier --db-snapshot-identifier $snapName --profile $global:AWSProfile | Out-Null
+                 Write-Host "OK" -ForegroundColor Green
+                 $retry = $false
+            } catch {
+                 Write-Host "FAILED: $_" -ForegroundColor Red
+                 $retryChoice = Read-Host "An error occurred. Do you want to retry the snapshot creation? (y to retry, n to return to main menu)"
+                 if ($retryChoice -ne 'y') {
+                     return # Exit function completely as per requirement
+                 } else {
+                     Write-Host "Retrying..." -ForegroundColor Yellow
+                 }
+            }
         }
     }
 
@@ -2024,11 +2273,11 @@ function New-MultipleRDSSnapshots-Interactive {
 
 function Remove-RDSSnapshot-Interactive {
     Show-Header
-    Write-Host "Fetching last 50 snapshots..." -ForegroundColor Green
+    Write-Host "Fetching ALL manual snapshots (this may take a moment)..." -ForegroundColor Green
 
     try {
-        # Fetch last 50 for selection (avoiding loading thousands)
-        $json = aws rds describe-db-snapshots --max-items 50 --output json --profile $global:AWSProfile | Out-String
+        # Fetch ALL manual snapshots (no pagination limit)
+        $json = aws rds describe-db-snapshots --snapshot-type manual --output json --profile $global:AWSProfile | Out-String
         if ([string]::IsNullOrWhiteSpace($json)) {
             Write-Host "No snapshots found." -ForegroundColor Yellow
             Read-Host "Press Enter to menu..."
@@ -2042,11 +2291,32 @@ function Remove-RDSSnapshot-Interactive {
             Read-Host "Press Enter to menu..."
             return
         }
+        
+        # Sort by creation time descending
+        $snaps = $snaps | Sort-Object SnapshotCreateTime -Descending
 
-        # Options
-        $options = @($snaps | ForEach-Object { "$($_.DBSnapshotIdentifier) ($($_.Status))" })
+        # Define headers for Viewport Engine
+        $header = {
+            param($SearchString, $TotalItems, $FilteredCount)
+            Show-Header
+            Write-Host "DELETE SNAPSHOTS (Manual)" -ForegroundColor Red
+            Write-Host "------------------------------------------"
+            Write-Host "Filter: $SearchString" -ForegroundColor Yellow
+            Write-Host "Showing $FilteredCount / $TotalItems snapshots" -ForegroundColor DarkGray
+            Write-Host "------------------------------------------"
+        }.GetNewClosure()
 
-        $selectedIndices = Show-Menu -Title "Select Snapshots to DELETE (SPACE to Select)" -Options $options -EnableFilter -MultiSelect
+        $footer = {
+            param($MultiSelect)
+            Write-Host "SPACE: Toggle Selection | ENTER: Confirm | Type to Filter" -ForegroundColor DarkGray
+        }.GetNewClosure()
+
+        # Call Viewport Engine
+        # We pass filter property DBSnapshotIdentifier
+        $selectedIndices = Invoke-InteractiveViewportSelection -Items $snaps -HeaderContent $header -FooterContent $footer -FilterProperties @("DBSnapshotIdentifier") -MultiSelect -ReturnIndex
+
+        if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
+        if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
 
         if ($selectedIndices -eq $null -or $selectedIndices.Count -eq 0) {
             Write-Host "No snapshots selected." -ForegroundColor Yellow
@@ -2054,14 +2324,26 @@ function Remove-RDSSnapshot-Interactive {
             return
         }
 
+        # Confirmation Screen
         Show-Header
-        Write-Host "SNAPSHOTS TO DELETE:" -ForegroundColor Red
+        Write-Host "WARNING: You have selected $($selectedIndices.Count) manual snapshots for deletion." -ForegroundColor Red -BackgroundColor Yellow
+        Write-Host "--------------------------------------------------" -ForegroundColor Red
+        
+        $limitDisplay = 10
+        $count = 0
         foreach ($idx in $selectedIndices) {
-            Write-Host " - $($snaps[$idx].DBSnapshotIdentifier)" -ForegroundColor Red
+            if ($count -lt $limitDisplay) {
+                Write-Host " - $($snaps[$idx].DBSnapshotIdentifier)" -ForegroundColor Red
+            }
+            $count++
         }
+        if ($selectedIndices.Count -gt $limitDisplay) {
+            Write-Host " ... and $($selectedIndices.Count - $limitDisplay) more." -ForegroundColor Red
+        }
+        Write-Host "--------------------------------------------------" -ForegroundColor Red
 
-        $confirm = Read-Host "Type 'DELETE' to confirm destruction of these snapshots"
-        if ($confirm -eq "DELETE") {
+        $confirm = Read-Host "Are you sure you want to permanently delete them? (y/n)"
+        if ($confirm -eq "y") {
              foreach ($idx in $selectedIndices) {
                 $s = $snaps[$idx]
                 Write-Host "Deleting '$($s.DBSnapshotIdentifier)'..." -ForegroundColor Yellow
@@ -2169,14 +2451,11 @@ function New-BGDeployment-Interactive {
         return
     }
 
-    $options = @($instances | ForEach-Object { "$($_.DBInstanceIdentifier) ($($_.Engine))" })
-    $options += "Cancel"
-
-    $idx = Show-Menu -Title "Step 1: Select Source DB for Blue/Green Deployment" -Options $options
-    if ($idx -eq ($options.Count - 1) -or $idx -eq -99) { return }
+    # Use new Live Filter Menu
+    $sourceObj = Select-RDSInstance-Live -Instances $instances -Title "Step 1: Select Source DB for Blue/Green Deployment"
+    if (!$sourceObj) { return }
 
     # Source ARN is required for --source
-    $sourceObj = $instances[$idx]
     $sourceARN = $sourceObj.DBInstanceArn
     $sourceDB = $sourceObj.DBInstanceIdentifier
     $engine = $sourceObj.Engine.Trim()
