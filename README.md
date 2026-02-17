@@ -1,13 +1,19 @@
 # AWS RDS Blue/Green Deployment Tool
 
 **Author:** Wojciech Kuncewicz DBA
-**Version:** 2026.02.12.02
+**Version:** 2026.02.16.07
 
 A comprehensive PowerShell-based interactive CLI tool for managing AWS RDS Blue/Green Deployments, Snapshots, and Database Upgrades. This tool simplifies complex AWS operations into an easy-to-use menu-driven interface.
 
 ## Features
 
+- **Performance Optimization:**
+    - **Data Caching:** RDS Instance lists are cached for 60 seconds to provide instant menu navigation. Press **F5** to force refresh.
+    - **Parallel Execution:** Batch operations (Create Multiple Snapshots, Update OS) now execute in parallel (requires PowerShell 7+), drastically reducing wait times.
+    - **Optimized Rendering & Parsing:** Uses `System.Text.StringBuilder` for flicker-free UI and streamlined JSON parsing logic for faster AWS CLI response handling.
+    - **Resilience:** Built-in Exponential Backoff for handling AWS Throttling and Rate Limit errors.
 - **Interactive Menu Interface:** Major UI/UX overhaul featuring "Frozen Headers" and viewport scrolling. Navigate large lists easily without losing context. Supports Search-as-you-type, multi-selection, and fast navigation.
+- **Flicker-Free Rendering:** Implements a Double-Buffered Virtual Screen engine using `System.Text.StringBuilder` and ANSI escape codes to eliminate screen flickering during menu navigation.
 - **AWS SSO Integration:** Automatically detects and configures AWS profiles.
 - **Client (Session) Filtering:** Filters profiles by AWS SSO Session (Client) for easier navigation.
 - **Environment Awareness:** Parses `env` and `type` fields from `.aws/config` to display visual warnings:
@@ -38,9 +44,7 @@ A comprehensive PowerShell-based interactive CLI tool for managing AWS RDS Blue/
 
 1. Clone the repository or download `rds_bg_manager.ps1`.
 2. Ensure you have `rds_bg_manager.config.ps1` in the same directory (created automatically if missing on first run, though usually distributed with the script).
-3. Unblock script.
-4. Install powershell 7
-5. Connect .ps1 extension with powershell7 to open it directly.
+3. Open PowerShell terminal.
 
 ## Configuration
 
@@ -116,6 +120,21 @@ On the first run, you will be prompted to select a **Client (SSO Session)**:
 Internal Tool.
 
 ## Changelog
+
+### 2026-02-16 (Part 3)
+- **Optimization:** Replaced array concatenation with `System.Collections.Generic.List` in menu engine.
+- **Optimization:** Global JSON parsing refactor for speed.
+- **Resilience:** Implemented Exponential Backoff for AWS Throttling errors.
+
+### 2026-02-16 (Part 2)
+- **Data Caching:** Added global caching for RDS instances (TTL 60s) to speed up UI navigation.
+- **F5 Refresh:** Added ability to force data refresh in menus and monitors.
+- **Parallel Processing:** Enabled parallel execution for batch snapshots and OS updates (PS 7+).
+
+### 2026-02-16 (Part 1)
+- Major Rendering Engine Overhaul: Implemented Double-Buffered "Virtual Screen" rendering for interactive menus to eliminate flickering.
+- Added ANSI helper functions for improved UI performance and string manipulation.
+- Updated core UI components to support non-blocking rendering.
 
 ### 2026-02-12
 - Refactored 'Delete Snapshots' to use the new viewport engine, allowing search, multi-selection, and bulk deletion of all manual snapshots (removed 50-item limit).
