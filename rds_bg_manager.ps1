@@ -1,4 +1,4 @@
-# VERSION: 2026.02.18.02
+# VERSION: 2026.02.18.03
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,18 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-02-18 (Part 3)
+    - FEATURE: Pre-Switchover Checklist — 4-point validation (deployment status, tasks completion, replica lag ≤1s, engine versions) with `FORCE` override option.
+    - FEATURE: CloudWatch Alarms Dashboard — fetches all alarms in `AWS/RDS` namespace, color-coded (ALARM/OK/INSUFFICIENT_DATA), with summary and CSV/HTML export.
+    - FEATURE: Parameter Group Comparison (`Compare-ParameterGroups`) — diffs user-modified parameters between source and target PGs. Auto-prompted during BG creation when a different PG is selected.
+    - FEATURE: Monitor Export — press `E` in `Monitor-RDS-State` to export current filtered view to CSV/HTML (identifier, engine, version, class, status, endpoint, MultiAZ, storage).
+    - FEATURE: Post-Switchover Cleanup Wizard — offers 3 options after switchover: snapshot+delete old source, delete BG resource only, or defer cleanup. Never auto-deletes.
+    - RELIABILITY: Migrated 17 remaining raw `aws` CLI calls to `Invoke-AWS-WithRetry` (RDS: create/delete-db-snapshot, describe-db-engine-versions ×2, describe-db-parameter-groups, modify-db-instance, delete-blue-green-deployment, delete-db-instance, switchover, start/stop-db-instance, download-db-log-file-portion; EC2: start/stop-instances, create/describe/delete-snapshot).
+    - CONFIG: Enhanced config file validation — validates hashtable format, warns on unknown keys, shows detailed parse errors with line numbers. Supports both `$LoadedConfig = @{...}` and bare `@{...}` config styles.
+    - OTA: Startup update check now shows version comparison banner and prompts user to update (auto-backup + restart) or skip.
+    - OTA: Relocated OTA option from Main Menu to `Select-Client-Session` menu. Main Menu simplified to 4 options.
+    - BUGFIX: `Show-All-Profiles` back/exit now returns `__RESTART__` to client selection instead of terminating the script.
+
     2026-02-18 (Part 2)
     - FEATURE: `Monitor-RDS-State` now supports live name filtering (type to filter, Backspace to delete, ESC to clear) and PgUp/PgDn pagination for large instance lists.
     - FEATURE: Expanded `Monitor-BGStatus-Interactive` into a full dashboard with SwitchoverDetails table, Tasks checklist, Replica Lag, engine versions, elapsed time, and flicker-free rendering.
@@ -158,17 +170,38 @@ $Global:Config = @{
 
 if (Test-Path $ConfigPath) {
     try {
-        # Dot-source config file instead of Invoke-Expression for security
+        # Dot-source config file — supports two styles:
+        #   Style 1 (assignment):  $LoadedConfig = @{ WindowTitle = '...' }
+        #   Style 2 (bare return): @{ WindowTitle = '...' }
         $LoadedConfig = $null
-        . $ConfigPath
+        $configOutput = . $ConfigPath
+
+        # If the file used bare @{} (Style 2), the hashtable comes back as output
+        if ($LoadedConfig -isnot [System.Collections.IDictionary] -and $configOutput -is [System.Collections.IDictionary]) {
+            $LoadedConfig = $configOutput
+        }
+
         if ($LoadedConfig -is [System.Collections.IDictionary]) {
+            $validKeys = @('WindowTitle', 'UpdateUrl', 'LogFileFormat')
             foreach ($key in $LoadedConfig.Keys) {
+                if ($key -notin $validKeys) {
+                    Write-Host "Config Warning: Unknown key '$key' in config file (valid: $($validKeys -join ', '))" -ForegroundColor Yellow
+                }
                 $Global:Config[$key] = $LoadedConfig[$key]
             }
+        } else {
+            Write-Host "Config Warning: Config file did not return a hashtable. Expected @{...} format." -ForegroundColor Yellow
+            Write-Host "Tip: Use either '@{ Key = Value }' or '$LoadedConfig = @{ Key = Value }'" -ForegroundColor DarkGray
+            Start-Sleep -Seconds 3
         }
     } catch {
-        Write-Host "Warning: Failed to load config file: $_" -ForegroundColor Red
-        Start-Sleep -Seconds 2
+        Write-Host "Config Error: Failed to load '$ConfigPath'" -ForegroundColor Red
+        Write-Host "  Details: $($_.Exception.Message)" -ForegroundColor Red
+        if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) {
+            Write-Host "  Location: Line $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Red
+        }
+        Write-Host "  The script will continue with default settings." -ForegroundColor Yellow
+        Start-Sleep -Seconds 3
     }
 }
 
@@ -1068,12 +1101,26 @@ function Select-Client-Session {
     }
 
     $options = @($sessions)
+
+    # OTA update option
+    $otaLabel = "Check for Updates (OTA)"
+    if ($global:UpdateAvailable) {
+        $otaLabel += " [new version found: $($global:UpdateAvailable.NewVersion)]"
+    }
+    $options += "------------------------------------------"
+    $options += $otaLabel
     $options += "Show All Profiles"
 
     $idx = Show-Menu -Title "Select Client (SSO Session)" -Options $options -EnableFilter
 
+    # OTA option
+    if ($idx -eq ($options.Count - 2)) {
+        Check-For-Updates-Interactive
+        return "__OTA__"  # Signal to re-show client menu
+    }
+
     if ($idx -eq ($options.Count - 1)) { return $null } # Show All
-    if ($idx -lt 0) { exit } # Cancel
+    if ($idx -lt 0) { exit } # Cancel (ESC at root = exit)
 
     $selectedSession = $sessions[$idx]
     return @{
@@ -1086,6 +1133,7 @@ function Select-Client-Session {
 function Select-AWSProfile {
     # 1. Select Session
     $sessionInfo = Select-Client-Session
+    if ($sessionInfo -eq "__OTA__") { return "__RESTART__" }
 
     Write-Log "Loading AWS Profiles..." -ForegroundColor Green
     try {
@@ -1144,9 +1192,7 @@ function Select-AWSProfile {
     
     # Exit/Back
     if ($idx -eq -1 -or $idx -eq ($displayProfiles.Count - 1)) {
-        if ($sessionInfo) { return "__RESTART__" } # Signal outer loop to restart
-        try { [Console]::CursorVisible = $true } catch {}
-        exit
+        return "__RESTART__" # Always go back to client selection (not exit)
     }
 
     # Delete Profile
@@ -1374,8 +1420,8 @@ function Start-EC2-Interactive {
     Write-Host "Starting EC2 instance: $id" -ForegroundColor Green
 
     try {
-        aws ec2 start-instances --instance-ids $id --profile $global:AWSProfile | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "EC2 start failed (exit code $LASTEXITCODE)" }
+        $startEc2Args = @("ec2", "start-instances", "--instance-ids", $id, "--profile", $global:AWSProfile)
+        Invoke-AWS-WithRetry -Arguments $startEc2Args | Out-Null
         Write-Host "Start command issued." -ForegroundColor Cyan
     } catch {
         Write-Host "Failed to start instance: $_" -ForegroundColor Red
@@ -1396,8 +1442,8 @@ function Stop-EC2-Interactive {
 
     if ($confirm -eq "STOP") {
         try {
-            aws ec2 stop-instances --instance-ids $id --profile $global:AWSProfile | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "EC2 stop failed (exit code $LASTEXITCODE)" }
+            $stopEc2Args = @("ec2", "stop-instances", "--instance-ids", $id, "--profile", $global:AWSProfile)
+            Invoke-AWS-WithRetry -Arguments $stopEc2Args | Out-Null
             Write-Host "Stop command issued." -ForegroundColor Cyan
         } catch {
             Write-Host "Failed to stop ${id}: $_" -ForegroundColor Red
@@ -1440,7 +1486,8 @@ function Create-EC2Snapshot-Interactive {
 
             Write-Host "Volume: $volId" -ForegroundColor Cyan
             try {
-                aws ec2 create-snapshot --volume-id $volId --description "$desc" --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=$defaultName}]" --profile $global:AWSProfile | Out-Null
+                $ec2SnapArgs = @("ec2", "create-snapshot", "--volume-id", $volId, "--description", $desc, "--tag-specifications", "ResourceType=snapshot,Tags=[{Key=Name,Value=$defaultName}]", "--profile", $global:AWSProfile)
+                Invoke-AWS-WithRetry -Arguments $ec2SnapArgs | Out-Null
                 Write-Host "  -> Snapshot initiated: $defaultName" -ForegroundColor Green
             } catch {
                 Write-Host "  -> Failed: $_" -ForegroundColor Red
@@ -1456,7 +1503,8 @@ function Remove-EC2Snapshot-Interactive {
 
     try {
         # Filter by Owner Self to avoid public snapshots
-        $json = (aws ec2 describe-snapshots --owner-ids self --max-items 50 --output json --profile $global:AWSProfile) -join ""
+        $ec2DescSnapArgs = @("ec2", "describe-snapshots", "--owner-ids", "self", "--max-items", "50", "--output", "json", "--profile", $global:AWSProfile)
+        $json = (Invoke-AWS-WithRetry -Arguments $ec2DescSnapArgs -ReturnJson) -join ""
         if ([string]::IsNullOrWhiteSpace($json)) {
             Write-Host "No snapshots found." -ForegroundColor Yellow
             Read-Host "Press Enter..."
@@ -1489,7 +1537,8 @@ function Remove-EC2Snapshot-Interactive {
                 $snapId = $snaps[$idx].SnapshotId
                 Write-Host "Deleting $snapId..." -ForegroundColor Yellow
                 try {
-                    aws ec2 delete-snapshot --snapshot-id $snapId --profile $global:AWSProfile | Out-Null
+                    $ec2DelSnapArgs = @("ec2", "delete-snapshot", "--snapshot-id", $snapId, "--profile", $global:AWSProfile)
+                    Invoke-AWS-WithRetry -Arguments $ec2DelSnapArgs | Out-Null
                     Write-Host "Deleted." -ForegroundColor Green
                 } catch {
                     Write-Host "Failed: $_" -ForegroundColor Red
@@ -1599,7 +1648,7 @@ function Monitor-RDS-State {
         # Page indicator + controls
         $refreshTime = Get-Date -Format "HH:mm:ss"
         $pageInfo = "Page $($currentPage + 1)/$totalPages"
-        $controlsLine = "  $refreshTime | $pageInfo | PgUp/PgDn: Navigate | F5: Refresh | ESC: $(if ($filter.Length -gt 0) {'Clear Filter'} else {'Exit'})"
+        $controlsLine = "  $refreshTime | $pageInfo | PgUp/PgDn: Navigate | F5: Refresh | E: Export | ESC: $(if ($filter.Length -gt 0) {'Clear Filter'} else {'Exit'})"
         [void]$sb.AppendLine((Pad-Line (Get-AnsiString $controlsLine -Color DarkGray) $winWidth))
 
         # Flush frame
@@ -1660,7 +1709,33 @@ function Monitor-RDS-State {
                     }
                 }
 
-                # Printable characters → add to filter
+                # Printable characters → add to filter (except 'e'/'E' which is export)
+                if ($k.KeyChar -eq 'e' -or $k.KeyChar -eq 'E') {
+                    # Export current filtered view
+                    try { [Console]::CursorVisible = $true } catch {}
+                    Clear-Host
+                    $exportData = [System.Collections.Generic.List[PSCustomObject]]::new()
+                    $dataToExport = if ($filter.Length -gt 0 -and $filtered) { $filtered } elseif ($instances) { $instances } else { @() }
+                    foreach ($inst in $dataToExport) {
+                        $ep = if ($inst.Endpoint) { $inst.Endpoint.Address } else { "-" }
+                        $exportData.Add([PSCustomObject]@{
+                            Identifier = $inst.DBInstanceIdentifier
+                            Engine = $inst.Engine
+                            EngineVersion = $inst.EngineVersion
+                            InstanceClass = $inst.DBInstanceClass
+                            Status = $inst.DBInstanceStatus
+                            Endpoint = $ep
+                            MultiAZ = $inst.MultiAZ
+                            StorageGB = $inst.AllocatedStorage
+                        })
+                    }
+                    Export-Report -Data $exportData -DefaultFileName "RDS-InstanceState-$(Get-TimeStamp)"
+                    Write-Host "Export complete. Press Enter to return to monitor..." -ForegroundColor Green
+                    Read-Host
+                    try { [Console]::CursorVisible = $false } catch {}
+                    $needsRedraw = $true
+                    break
+                }
                 if ($k.KeyChar -and $k.KeyChar -ge ' ') {
                     $filter += $k.KeyChar
                     $currentPage = 0
@@ -2063,7 +2138,8 @@ function View-LogContent {
         # download-db-log-file-portion returns text.
         # We handle pagination loosely here by just grabbing the default (which is usually start-to-end or large chunk).
         # For huge files, this might be slow, but for typical error logs it's okay.
-        $content = aws rds download-db-log-file-portion --db-instance-identifier $InstanceIdentifier --log-file-name $LogFileName --output text --profile $global:AWSProfile
+        $logArgs = @("rds", "download-db-log-file-portion", "--db-instance-identifier", $InstanceIdentifier, "--log-file-name", $LogFileName, "--output", "text", "--profile", $global:AWSProfile)
+        $content = Invoke-AWS-WithRetry -Arguments $logArgs
         
         if ([string]::IsNullOrWhiteSpace($content)) {
             Write-Host "Log file is empty." -ForegroundColor Yellow
@@ -2394,6 +2470,113 @@ function Show-RDSRecommendations {
     Read-Host "Press Enter to menu..."
 }
 
+function Show-CloudWatchAlarms {
+    Show-Header
+    Write-Host "Fetching CloudWatch Alarms for AWS/RDS namespace..." -ForegroundColor Green
+
+    try {
+        $alarmArgs = @("cloudwatch", "describe-alarms", "--state-value", "OK", "--output", "json", "--profile", $global:AWSProfile)
+        $alarmArgsAlarm = @("cloudwatch", "describe-alarms", "--state-value", "ALARM", "--output", "json", "--profile", $global:AWSProfile)
+        $alarmArgsInsufficient = @("cloudwatch", "describe-alarms", "--state-value", "INSUFFICIENT_DATA", "--output", "json", "--profile", $global:AWSProfile)
+
+        $allAlarms = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        foreach ($args in @($alarmArgs, $alarmArgsAlarm, $alarmArgsInsufficient)) {
+            $json = (Invoke-AWS-WithRetry -Arguments $args -ReturnJson) -join ""
+            if (![string]::IsNullOrWhiteSpace($json)) {
+                $data = $json | ConvertFrom-Json
+                if ($data.MetricAlarms) {
+                    foreach ($a in $data.MetricAlarms) {
+                        # Filter only AWS/RDS namespace
+                        if ($a.Namespace -eq "AWS/RDS") {
+                            $allAlarms.Add($a)
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($allAlarms.Count -eq 0) {
+            Write-Host "`nNo CloudWatch Alarms found for AWS/RDS namespace." -ForegroundColor Yellow
+            Read-Host "Press Enter to menu..."
+            return
+        }
+
+        # Sort: ALARM first, then INSUFFICIENT_DATA, then OK
+        $sorted = $allAlarms | Sort-Object @{Expression={
+            switch ($_.StateValue) { "ALARM" { 0 } "INSUFFICIENT_DATA" { 1 } default { 2 } }
+        }}
+
+        Write-Host "`nFound $($allAlarms.Count) RDS alarm(s):" -ForegroundColor Cyan
+        Write-Host "------------------------------------------------------------------------------------------------------------------------"
+        Write-Host ("{0,-40} {1,-12} {2,-25} {3,-8} {4,-15} {5,-25}" -f "Alarm Name", "State", "Metric", "Op", "Threshold", "DB Instance") -ForegroundColor White
+        Write-Host "------------------------------------------------------------------------------------------------------------------------" -ForegroundColor Gray
+
+        $exportData = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        foreach ($alarm in $sorted) {
+            $color = switch ($alarm.StateValue) {
+                "OK"                 { "Green" }
+                "ALARM"              { "Red" }
+                "INSUFFICIENT_DATA"  { "Yellow" }
+                default              { "White" }
+            }
+
+            # Extract DB instance from dimensions
+            $dbInst = "-"
+            if ($alarm.Dimensions) {
+                $dim = $alarm.Dimensions | Where-Object { $_.Name -eq "DBInstanceIdentifier" }
+                if ($dim) { $dbInst = $dim.Value }
+            }
+
+            $op = switch ($alarm.ComparisonOperator) {
+                "GreaterThanThreshold"            { ">" }
+                "GreaterThanOrEqualToThreshold"   { ">=" }
+                "LessThanThreshold"               { "<" }
+                "LessThanOrEqualToThreshold"      { "<=" }
+                default                           { $alarm.ComparisonOperator }
+            }
+
+            $name = if ($alarm.AlarmName.Length -gt 38) { $alarm.AlarmName.Substring(0, 38) + ".." } else { $alarm.AlarmName }
+            $metric = $alarm.MetricName
+            $threshold = $alarm.Threshold
+
+            Write-Host ("{0,-40} {1,-12} {2,-25} {3,-8} {4,-15} {5,-25}" -f $name, $alarm.StateValue, $metric, $op, $threshold, $dbInst) -ForegroundColor $color
+
+            $exportData.Add([PSCustomObject]@{
+                AlarmName    = $alarm.AlarmName
+                State        = $alarm.StateValue
+                Metric       = $metric
+                Operator     = $op
+                Threshold    = $threshold
+                DBInstance   = $dbInst
+                StateReason  = $alarm.StateReason
+            })
+        }
+        Write-Host "------------------------------------------------------------------------------------------------------------------------"
+
+        # Summary
+        $alarmCount = ($allAlarms | Where-Object { $_.StateValue -eq "ALARM" }).Count
+        $okCount = ($allAlarms | Where-Object { $_.StateValue -eq "OK" }).Count
+        $insuffCount = ($allAlarms | Where-Object { $_.StateValue -eq "INSUFFICIENT_DATA" }).Count
+        Write-Host ""
+        if ($alarmCount -gt 0) {
+            Write-Host "  ALARM: $alarmCount" -ForegroundColor Red -NoNewline
+        }
+        Write-Host "  OK: $okCount" -ForegroundColor Green -NoNewline
+        if ($insuffCount -gt 0) {
+            Write-Host "  INSUFFICIENT_DATA: $insuffCount" -ForegroundColor Yellow -NoNewline
+        }
+        Write-Host ""
+
+        Export-Report -Data $exportData -DefaultFileName "CloudWatchAlarms-RDS"
+
+    } catch {
+        Write-Host "Error fetching alarms: $_" -ForegroundColor Red
+    }
+    Read-Host "Press Enter to menu..."
+}
+
 function Show-InstanceReports-Menu {
     if (!$global:SelectedInstance) {
         Write-Host "No active instance selected. Please select an instance first." -ForegroundColor Yellow
@@ -2419,7 +2602,7 @@ function Show-InstanceReports-Menu {
 
 function Show-OtherReports-Menu {
     while ($true) {
-        $menuOptions = @("Pending OS Upgrade", "DB All Details", "DB Versions (Compact)", "Recommendation list", "Back")
+        $menuOptions = @("Pending OS Upgrade", "DB All Details", "DB Versions (Compact)", "Recommendation list", "CloudWatch Alarms (RDS)", "Back")
         $sel = Show-Menu -Title "Other Reports" -Options $menuOptions
         
         switch ($sel) {
@@ -2427,7 +2610,8 @@ function Show-OtherReports-Menu {
             1 { Show-DBAllDetails }
             2 { Show-DBVersionsCompact }
             3 { Show-RDSRecommendations }
-            4 { return }
+            4 { Show-CloudWatchAlarms }
+            5 { return }
         }
     }
 }
@@ -2518,7 +2702,8 @@ function New-RDSSnapshot-Interactive {
     while ($retry) {
         Write-Log "`nCreating snapshot '$snapName'..." -ForegroundColor Green
         try {
-            aws rds create-db-snapshot --db-instance-identifier $selectedID --db-snapshot-identifier $snapName --profile $global:AWSProfile | Out-Null
+            $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $selectedID, "--db-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+            Invoke-AWS-WithRetry -Arguments $snapArgs | Out-Null
             Write-Log "Success! Snapshot creation initiated in background." -ForegroundColor Cyan
 
             $retry = $false # Success, exit retry loop
@@ -2813,7 +2998,8 @@ function Remove-RDSSnapshot-Interactive {
                 $s = $snaps[$idx]
                 Write-Host "Deleting '$($s.DBSnapshotIdentifier)'..." -ForegroundColor Yellow
                 try {
-                    aws rds delete-db-snapshot --db-snapshot-identifier $s.DBSnapshotIdentifier --profile $global:AWSProfile | Out-Null
+                    $delSnapArgs = @("rds", "delete-db-snapshot", "--db-snapshot-identifier", $s.DBSnapshotIdentifier, "--profile", $global:AWSProfile)
+                    Invoke-AWS-WithRetry -Arguments $delSnapArgs | Out-Null
                     Write-Host "Deleted." -ForegroundColor Green
                 } catch {
                     Write-Host "Failed: $_" -ForegroundColor Red
@@ -2940,7 +3126,8 @@ function New-BGDeployment-Interactive {
 
     try {
         # Added --include-all to ensure we find the version even if it's not the default
-        $json = (aws rds describe-db-engine-versions --engine $engine --engine-version $currentVer --include-all --output json --profile $global:AWSProfile) -join ""
+        $engArgs = @("rds", "describe-db-engine-versions", "--engine", $engine, "--engine-version", $currentVer, "--include-all", "--output", "json", "--profile", $global:AWSProfile)
+        $json = (Invoke-AWS-WithRetry -Arguments $engArgs -ReturnJson) -join ""
         if (![string]::IsNullOrWhiteSpace($json)) {
              $data = $json | ConvertFrom-Json
              $validUpgrades = $data.DBEngineVersions.ValidUpgradeTarget
@@ -2997,7 +3184,8 @@ function New-BGDeployment-Interactive {
 
     try {
         # Get Family
-        $famJson = (aws rds describe-db-engine-versions --engine $engine --engine-version $verToQuery --include-all --output json --profile $global:AWSProfile) -join ""
+        $famArgs = @("rds", "describe-db-engine-versions", "--engine", $engine, "--engine-version", $verToQuery, "--include-all", "--output", "json", "--profile", $global:AWSProfile)
+        $famJson = (Invoke-AWS-WithRetry -Arguments $famArgs -ReturnJson) -join ""
         if (![string]::IsNullOrWhiteSpace($famJson)) {
             $famData = $famJson | ConvertFrom-Json
             if ($famData.DBEngineVersions) {
@@ -3007,7 +3195,8 @@ function New-BGDeployment-Interactive {
 
         if ($targetFamily) {
              # Get Parameter Groups by Family
-             $pgJson = (aws rds describe-db-parameter-groups --filters "Name=db-parameter-group-family,Values=$targetFamily" --output json --profile $global:AWSProfile) -join ""
+             $pgArgs = @("rds", "describe-db-parameter-groups", "--filters", "Name=db-parameter-group-family,Values=$targetFamily", "--output", "json", "--profile", $global:AWSProfile)
+             $pgJson = (Invoke-AWS-WithRetry -Arguments $pgArgs -ReturnJson) -join ""
              if (![string]::IsNullOrWhiteSpace($pgJson)) {
                  $pgData = $pgJson | ConvertFrom-Json
                  $pgs = $pgData.DBParameterGroups
@@ -3056,6 +3245,18 @@ function New-BGDeployment-Interactive {
 
     $displayPG = if ($pgName) { $pgName } else { "Default" }
     Write-Host "Parameter Group Selected: $displayPG" -ForegroundColor Green
+
+    # Offer comparison if user selected a specific PG different from source
+    if ($pgName -and $sourceObj.DBParameterGroups) {
+        $sourcePG = $sourceObj.DBParameterGroups[0].DBParameterGroupName
+        if ($sourcePG -and $sourcePG -ne $pgName) {
+            $cmpChoice = Read-Host "Compare parameter groups '$sourcePG' vs '$pgName'? (y/N)"
+            if ($cmpChoice -eq 'y') {
+                Compare-ParameterGroups -SourcePG $sourcePG -TargetPG $pgName
+            }
+        }
+    }
+
     Start-Sleep -Seconds 1
 
     # 4. BG Deployment Name & Green DB Name
@@ -3568,7 +3769,8 @@ function Remove-BGDeployment-Interactive {
     if ($instanceToDelete) {
         Write-Host "Disabling deletion protection on $instanceToDelete..." -ForegroundColor Cyan
         try {
-            aws rds modify-db-instance --db-instance-identifier $instanceToDelete --no-deletion-protection --apply-immediately --profile $global:AWSProfile | Out-Null
+            $modArgs = @("rds", "modify-db-instance", "--db-instance-identifier", $instanceToDelete, "--no-deletion-protection", "--apply-immediately", "--profile", $global:AWSProfile)
+            Invoke-AWS-WithRetry -Arguments $modArgs | Out-Null
             Write-Host "Done." -ForegroundColor Green
         } catch {
             Write-Host "Failed to disable protection: $_" -ForegroundColor Red
@@ -3585,7 +3787,8 @@ function Remove-BGDeployment-Interactive {
         # If we want to delete a SPECIFIC instance, we should do it manually via delete-db-instance as planned below.
         # Using --delete-target is risky if roles swapped.
         # Safest is to delete BG resource WITHOUT target deletion, then delete instance manually.
-        aws rds delete-blue-green-deployment --blue-green-deployment-identifier $bgId --no-delete-target --profile $global:AWSProfile | Out-Null
+        $bgDelArgs = @("rds", "delete-blue-green-deployment", "--blue-green-deployment-identifier", $bgId, "--no-delete-target", "--profile", $global:AWSProfile)
+        Invoke-AWS-WithRetry -Arguments $bgDelArgs | Out-Null
         Write-Host "Deployment deletion initiated." -ForegroundColor Green
     } catch {
         Write-Host "Failed to delete BG Deployment: $_" -ForegroundColor Red
@@ -3596,7 +3799,8 @@ function Remove-BGDeployment-Interactive {
     if ($instanceToDelete) {
         Write-Host "Deleting Instance $instanceToDelete..." -ForegroundColor Red
         try {
-            aws rds delete-db-instance --db-instance-identifier $instanceToDelete --skip-final-snapshot --profile $global:AWSProfile | Out-Null
+            $delInstArgs = @("rds", "delete-db-instance", "--db-instance-identifier", $instanceToDelete, "--skip-final-snapshot", "--profile", $global:AWSProfile)
+            Invoke-AWS-WithRetry -Arguments $delInstArgs | Out-Null
             Write-Host "Instance deletion initiated." -ForegroundColor Green
         } catch {
             Write-Host "Failed to delete instance: $_" -ForegroundColor Red
@@ -3604,6 +3808,179 @@ function Remove-BGDeployment-Interactive {
     }
 
     Read-Host "Press Enter to menu..."
+}
+
+function Compare-ParameterGroups {
+    param(
+        [string]$SourcePG,
+        [string]$TargetPG
+    )
+
+    Show-Header
+    Write-Host "Comparing Parameter Groups..." -ForegroundColor Green
+    Write-Host "  Source: $SourcePG" -ForegroundColor White
+    Write-Host "  Target: $TargetPG" -ForegroundColor White
+    Write-Host ""
+
+    try {
+        # Fetch source parameters (only user-modified ones to reduce noise)
+        $srcArgs = @("rds", "describe-db-parameters", "--db-parameter-group-name", $SourcePG, "--source", "user", "--output", "json", "--profile", $global:AWSProfile)
+        $srcJson = (Invoke-AWS-WithRetry -Arguments $srcArgs -ReturnJson) -join ""
+        $srcParams = @{}
+        if (![string]::IsNullOrWhiteSpace($srcJson)) {
+            $srcData = ($srcJson | ConvertFrom-Json).Parameters
+            foreach ($p in $srcData) { $srcParams[$p.ParameterName] = $p.ParameterValue }
+        }
+
+        # Fetch target parameters (user-modified)
+        $tgtArgs = @("rds", "describe-db-parameters", "--db-parameter-group-name", $TargetPG, "--source", "user", "--output", "json", "--profile", $global:AWSProfile)
+        $tgtJson = (Invoke-AWS-WithRetry -Arguments $tgtArgs -ReturnJson) -join ""
+        $tgtParams = @{}
+        if (![string]::IsNullOrWhiteSpace($tgtJson)) {
+            $tgtData = ($tgtJson | ConvertFrom-Json).Parameters
+            foreach ($p in $tgtData) { $tgtParams[$p.ParameterName] = $p.ParameterValue }
+        }
+
+        # Compute diff
+        $allKeys = @($srcParams.Keys) + @($tgtParams.Keys) | Sort-Object -Unique
+        $diffs = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        foreach ($key in $allKeys) {
+            $srcVal = if ($srcParams.ContainsKey($key)) { $srcParams[$key] } else { "(default)" }
+            $tgtVal = if ($tgtParams.ContainsKey($key)) { $tgtParams[$key] } else { "(default)" }
+
+            if ($srcVal -ne $tgtVal) {
+                $diffs.Add([PSCustomObject]@{
+                    Parameter = $key
+                    Source    = $srcVal
+                    Target    = $tgtVal
+                })
+            }
+        }
+
+        if ($diffs.Count -eq 0) {
+            Write-Host "No differences found (user-modified parameters are identical)." -ForegroundColor Green
+        } else {
+            Write-Host "Found $($diffs.Count) difference(s):" -ForegroundColor Yellow
+            Write-Host "------------------------------------------------------------------------------------------------------------------------"
+            Write-Host ("{0,-40} {1,-35} {2,-35}" -f "Parameter", "Source ($SourcePG)", "Target ($TargetPG)") -ForegroundColor White
+            Write-Host "------------------------------------------------------------------------------------------------------------------------" -ForegroundColor Gray
+
+            foreach ($d in $diffs) {
+                $srcDisplay = if ($d.Source -eq "(default)") { "(default)" } else { $d.Source }
+                $tgtDisplay = if ($d.Target -eq "(default)") { "(default)" } else { $d.Target }
+                Write-Host ("{0,-40} {1,-35} {2,-35}" -f $d.Parameter, $srcDisplay, $tgtDisplay) -ForegroundColor Cyan
+            }
+            Write-Host "------------------------------------------------------------------------------------------------------------------------"
+        }
+
+        Export-Report -Data $diffs -DefaultFileName "PG-Compare-$SourcePG-vs-$TargetPG"
+
+    } catch {
+        Write-Host "Error comparing parameter groups: $_" -ForegroundColor Red
+    }
+    Read-Host "Press Enter to continue..."
+}
+
+function Start-PostSwitchoverCleanup {
+    param(
+        [string]$BGDeploymentId,
+        [string]$OldSourceId
+    )
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  POST-SWITCHOVER CLEANUP WIZARD" -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "After a successful switchover, the old Blue (source) resources remain." -ForegroundColor White
+    Write-Host "Old Source DB: $OldSourceId" -ForegroundColor Yellow
+    Write-Host "BG Deployment: $BGDeploymentId" -ForegroundColor Yellow
+    Write-Host ""
+
+    $cleanupOptions = @(
+        "Create Snapshot of old source + Delete old source now",
+        "Delete BG Deployment resource only (keep old instances for later cleanup)",
+        "Skip cleanup for now (defer to later)"
+    )
+
+    $choice = Show-Menu -Title "Post-Switchover Cleanup" -Options $cleanupOptions
+    if ($choice -lt 0) { return }
+
+    switch ($choice) {
+        0 {
+            # Snapshot + Delete
+            Write-Host ""
+            $snapName = "final-pre-cleanup-$OldSourceId-$(Get-TimeStamp)"
+            Write-Host "Creating final snapshot: $snapName" -ForegroundColor Cyan
+
+            try {
+                $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $OldSourceId, "--db-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+                Invoke-AWS-WithRetry -Arguments $snapArgs | Out-Null
+                Write-Host "Snapshot creation initiated." -ForegroundColor Green
+            } catch {
+                Write-Host "Failed to create snapshot: $_" -ForegroundColor Red
+                Write-Host "Aborting cleanup. Please handle manually." -ForegroundColor Yellow
+                Read-Host "Press Enter to continue..."
+                return
+            }
+
+            Write-Host ""
+            $deleteConfirm = Read-Host "Type 'DELETE' to delete old source instance '$OldSourceId' (or anything else to skip)"
+
+            if ($deleteConfirm -eq "DELETE") {
+                try {
+                    # Disable deletion protection if enabled
+                    $modArgs = @("rds", "modify-db-instance", "--db-instance-identifier", $OldSourceId, "--no-deletion-protection", "--apply-immediately", "--output", "json", "--profile", $global:AWSProfile)
+                    Invoke-AWS-WithRetry -Arguments $modArgs -ReturnJson | Out-Null
+                } catch {
+                    Write-Host "Warning: Could not disable deletion protection: $_" -ForegroundColor Yellow
+                }
+
+                try {
+                    $delArgs = @("rds", "delete-db-instance", "--db-instance-identifier", $OldSourceId, "--skip-final-snapshot", "--profile", $global:AWSProfile)
+                    Invoke-AWS-WithRetry -Arguments $delArgs | Out-Null
+                    Write-Host "Instance deletion initiated." -ForegroundColor Green
+                    $global:RDSInstancesCache = $null
+                } catch {
+                    Write-Host "Failed to delete instance: $_" -ForegroundColor Red
+                }
+            } else {
+                Write-Host "Instance deletion skipped. You can delete it manually later." -ForegroundColor Yellow
+            }
+
+            # Delete BG resource
+            try {
+                $bgDelArgs = @("rds", "delete-blue-green-deployment", "--blue-green-deployment-identifier", $BGDeploymentId, "--no-delete-target", "--profile", $global:AWSProfile)
+                Invoke-AWS-WithRetry -Arguments $bgDelArgs | Out-Null
+                Write-Host "BG Deployment resource deleted." -ForegroundColor Green
+            } catch {
+                Write-Host "Failed to delete BG deployment: $_" -ForegroundColor Red
+            }
+        }
+        1 {
+            # Delete BG resource only
+            Write-Host ""
+            $confirm = Read-Host "Type 'DELETE' to delete BG Deployment resource (instances will remain)"
+            if ($confirm -eq "DELETE") {
+                try {
+                    $bgDelArgs = @("rds", "delete-blue-green-deployment", "--blue-green-deployment-identifier", $BGDeploymentId, "--no-delete-target", "--profile", $global:AWSProfile)
+                    Invoke-AWS-WithRetry -Arguments $bgDelArgs | Out-Null
+                    Write-Host "BG Deployment resource deleted. Old instances remain for manual cleanup." -ForegroundColor Green
+                } catch {
+                    Write-Host "Failed to delete BG deployment: $_" -ForegroundColor Red
+                }
+            } else {
+                Write-Host "Operation cancelled." -ForegroundColor Yellow
+            }
+        }
+        2 {
+            Write-Host "Cleanup deferred. Remember to clean up old resources later!" -ForegroundColor Yellow
+            Write-Host "  - Old Source: $OldSourceId" -ForegroundColor DarkGray
+            Write-Host "  - BG Deployment: $BGDeploymentId" -ForegroundColor DarkGray
+            Write-Log "POST-SWITCHOVER CLEANUP DEFERRED: OldSource=$OldSourceId, BGDeployment=$BGDeploymentId"
+        }
+    }
 }
 
 function Invoke-Switchover-Interactive {
@@ -3614,8 +3991,6 @@ function Invoke-Switchover-Interactive {
         return
     }
 
-    # Filter for AVAILABLE only? Or allow user to try anyway? 
-    # Better to show all but mark them.
     $options = @($bgs | ForEach-Object {
         $mark = if ($_.Status -eq "AVAILABLE") { "[READY]" } else { "[NOT READY]" }
         "$mark $($_.BlueGreenDeploymentName) ($($_.Status))" 
@@ -3624,62 +3999,141 @@ function Invoke-Switchover-Interactive {
 
     $idx = Show-Menu -Title "Select Deployment to PROMOTE (Switchover)" -Options $options -EnableFilter
     if ($idx -eq ($options.Count - 1)) { return }
+    if ($idx -lt 0) { return }
 
     $bgObj = $bgs[$idx]
-    
-    if ($bgObj.Status -ne "AVAILABLE") {
-        # Ostrzegamy uzytkownika / We warn the user
-        Write-Log "Warning: Status is '$($bgObj.Status)'. Switchover will likely fail." -ForegroundColor Red
-        $proceed = Read-Host "Do you want to proceed anyway? (y/n)"
-        if ($proceed -ne 'y') { return }
+    $bgId = $bgObj.BlueGreenDeploymentIdentifier
+
+    Show-Header
+    Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║        PRE-SWITCHOVER CHECKLIST                 ║" -ForegroundColor Cyan
+    Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Extract source and target IDs
+    $sourceId = Get-InstanceIdFromArn $bgObj.Source
+    $targetId = Get-InstanceIdFromArn $bgObj.Target
+
+    Write-Host "  Deployment: $($bgObj.BlueGreenDeploymentName)" -ForegroundColor White
+    Write-Host "  Source DB:  $sourceId" -ForegroundColor White
+    Write-Host "  Target DB:  $targetId" -ForegroundColor White
+    Write-Host ""
+
+    $checksPassed = 0
+    $checksTotal = 4
+    $hasCriticalFailure = $false
+
+    # --- CHECK 1: Deployment Status ---
+    Write-Host -NoNewline "  [1/4] Deployment Status: "
+    if ($bgObj.Status -eq "AVAILABLE") {
+        Write-Host "AVAILABLE ✓" -ForegroundColor Green
+        $checksPassed++
+    } else {
+        Write-Host "$($bgObj.Status) ✗ (CRITICAL)" -ForegroundColor Red
+        $hasCriticalFailure = $true
     }
 
-    $bgId = $bgObj.BlueGreenDeploymentIdentifier
-    
-    Show-Header
-    Write-Host "PREPARING TO SWITCHOVER: $bgId" -ForegroundColor Magenta
+    # --- CHECK 2: Tasks Completion ---
+    Write-Host -NoNewline "  [2/4] Tasks Status:      "
+    $allTasksComplete = $true
+    if ($bgObj.Tasks) {
+        $incomplete = $bgObj.Tasks | Where-Object { $_.Status -ne "COMPLETED" -and $_.Status -ne "N/A" }
+        if ($incomplete) {
+            $allTasksComplete = $false
+            Write-Host "INCOMPLETE ✗" -ForegroundColor Red
+            foreach ($t in $incomplete) {
+                Write-Host "         - $($t.Name): $($t.Status)" -ForegroundColor Yellow
+            }
+            $hasCriticalFailure = $true
+        } else {
+            Write-Host "ALL COMPLETED ✓" -ForegroundColor Green
+            $checksPassed++
+        }
+    } else {
+        Write-Host "No task data ⚠" -ForegroundColor Yellow
+        $checksPassed++ # Non-critical
+    }
 
-    # Check Replica Lag
-    if ($bgObj.Target -match ":db:(.+)$") {
-        $targetId = $matches[1]
-        Write-Host "Checking Replica Lag for Green DB ($targetId)..." -ForegroundColor Cyan
-
+    # --- CHECK 3: Replica Lag ---
+    Write-Host -NoNewline "  [3/4] Replica Lag:       "
+    $lagSeconds = $null
+    if ($targetId) {
         try {
             $endTime = Get-Date
             $startTime = $endTime.AddMinutes(-15)
             $endStr = $endTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
             $startStr = $startTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-            $lagArgs = @(
-                "cloudwatch", "get-metric-statistics",
-                "--namespace", "AWS/RDS",
-                "--metric-name", "ReplicaLag",
-                "--dimensions", "Name=DBInstanceIdentifier,Value=$targetId",
-                "--start-time", $startStr,
-                "--end-time", $endStr,
-                "--period", "60",
-                "--statistics", "Maximum",
-                "--query", "Datapoints | sort_by(@, &Timestamp) | [-1].Maximum",
-                "--output", "text",
-                "--profile", $global:AWSProfile
-            )
-
-            # Execute using our robust retry wrapper (returns array of strings or raw object)
-            $lagOutput = Invoke-AWS-WithRetry -Arguments $lagArgs
-            $lagText = ($lagOutput -join "").Trim()
-
-            $lagVal = "Unknown"
-            if (![string]::IsNullOrWhiteSpace($lagText) -and $lagText -ne "None") {
-                $lagVal = "$lagText seconds"
-            } else {
-                $lagVal = "No Data (CloudWatch delay or metric not available)"
+            $lagArgs = @("cloudwatch", "get-metric-statistics", "--namespace", "AWS/RDS", "--metric-name", "ReplicaLag", "--dimensions", "Name=DBInstanceIdentifier,Value=$targetId", "--start-time", $startStr, "--end-time", $endStr, "--period", "300", "--statistics", "Maximum", "--output", "json", "--profile", $global:AWSProfile)
+            $lagOut = (Invoke-AWS-WithRetry -Arguments $lagArgs -ReturnJson) -join ""
+            if (![string]::IsNullOrWhiteSpace($lagOut)) {
+                $lagData = $lagOut | ConvertFrom-Json
+                if ($lagData.Datapoints -and $lagData.Datapoints.Count -gt 0) {
+                    $point = $lagData.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1
+                    $lagSeconds = $point.Maximum
+                }
             }
-            Write-Host "Current Replica Lag: $lagVal" -ForegroundColor Yellow
-        } catch {
-            Write-Host "Could not fetch lag: $_" -ForegroundColor Red
-        }
+        } catch {}
     }
 
+    if ($lagSeconds -ne $null) {
+        if ($lagSeconds -le 1) {
+            Write-Host "${lagSeconds}s ✓" -ForegroundColor Green
+            $checksPassed++
+        } else {
+            Write-Host "${lagSeconds}s ⚠ (WARNING: >1s)" -ForegroundColor Yellow
+            $checksPassed++ # Warning but not critical
+        }
+    } else {
+        Write-Host "No Data ⚠" -ForegroundColor Yellow
+        $checksPassed++ # Non-critical if metric not yet published
+    }
+
+    # --- CHECK 4: Engine Versions ---
+    Write-Host -NoNewline "  [4/4] Engine Versions:   "
+    try {
+        $instances = Get-CachedRDSInstances
+        $srcInst = $instances | Where-Object { $_.DBInstanceIdentifier -eq $sourceId }
+        $tgtInst = $instances | Where-Object { $_.DBInstanceIdentifier -eq $targetId }
+
+        if ($srcInst -and $tgtInst) {
+            $srcVer = "$($srcInst.Engine) $($srcInst.EngineVersion)"
+            $tgtVer = "$($tgtInst.Engine) $($tgtInst.EngineVersion)"
+            if ($srcVer -eq $tgtVer) {
+                Write-Host "$srcVer = $tgtVer ✓" -ForegroundColor Green
+            } else {
+                Write-Host "$srcVer → $tgtVer ✓ (Upgrade)" -ForegroundColor Green
+            }
+            $checksPassed++
+        } else {
+            Write-Host "Could not fetch instance details ⚠" -ForegroundColor Yellow
+            $checksPassed++
+        }
+    } catch {
+        Write-Host "Error ⚠" -ForegroundColor Yellow
+        $checksPassed++
+    }
+
+    # --- Summary ---
+    Write-Host ""
+    Write-Host "  ─────────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "  Result: $checksPassed/$checksTotal checks passed" -NoNewline
+
+    if ($hasCriticalFailure) {
+        Write-Host " — CRITICAL FAILURES DETECTED" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  Some critical checks failed. Switchover will likely fail." -ForegroundColor Red
+        $override = Read-Host "  Type 'FORCE' to proceed anyway, or press Enter to abort"
+        if ($override -ne "FORCE") {
+            Write-Host "  Switchover aborted." -ForegroundColor Yellow
+            Read-Host "Press Enter to menu..."
+            return
+        }
+    } else {
+        Write-Host " — ALL OK" -ForegroundColor Green
+    }
+
+    Write-Host ""
     $confirm = Read-Host "Type 'PROMOTE' to confirm switchover"
     if ($confirm -eq "PROMOTE") {
         $timeout = Read-Host "Enter Timeout in seconds (default: 300)"
@@ -3687,8 +4141,16 @@ function Invoke-Switchover-Interactive {
 
         Write-Log "Executing Switchover..." -ForegroundColor Green
         try {
-            aws rds switchover-blue-green-deployment --blue-green-deployment-identifier $bgId --switchover-timeout $timeout --profile $global:AWSProfile
+            $swArgs = @("rds", "switchover-blue-green-deployment", "--blue-green-deployment-identifier", $bgId, "--switchover-timeout", $timeout, "--profile", $global:AWSProfile)
+            Invoke-AWS-WithRetry -Arguments $swArgs | Out-Null
             Write-Log "Switchover initiated! The database is flipping to Green." -ForegroundColor Cyan
+
+            Write-Host ""
+            Write-Host "Switchover is in progress. After completion, you can run the cleanup wizard." -ForegroundColor White
+            $cleanup = Read-Host "Run Post-Switchover Cleanup Wizard now? (y/N)"
+            if ($cleanup -eq 'y') {
+                Start-PostSwitchoverCleanup -BGDeploymentId $bgId -OldSourceId $sourceId
+            }
         } catch {
             Write-Log "Switchover Failed: $_" -ForegroundColor Red
         }
@@ -4042,7 +4504,8 @@ function Start-RDS-Interactive {
 
         Write-Host "Starting '$id'..." -ForegroundColor Cyan
         try {
-            aws rds start-db-instance --db-instance-identifier $id --profile $global:AWSProfile | Out-Null
+            $startArgs = @("rds", "start-db-instance", "--db-instance-identifier", $id, "--profile", $global:AWSProfile)
+            Invoke-AWS-WithRetry -Arguments $startArgs | Out-Null
             Write-Host "Start command issued for $id." -ForegroundColor Green
             $global:RDSInstancesCache = $null  # Invalidate cache after state change
         } catch {
@@ -4087,7 +4550,8 @@ function Stop-RDS-Interactive {
 
             Write-Host "Stopping '$id'..." -ForegroundColor Yellow
             try {
-                aws rds stop-db-instance --db-instance-identifier $id --profile $global:AWSProfile | Out-Null
+                $stopArgs = @("rds", "stop-db-instance", "--db-instance-identifier", $id, "--profile", $global:AWSProfile)
+                Invoke-AWS-WithRetry -Arguments $stopArgs | Out-Null
                 Write-Host "Stop command issued for $id." -ForegroundColor Green
                 $global:RDSInstancesCache = $null  # Invalidate cache after state change
             } catch {
@@ -4348,8 +4812,32 @@ if ($MyInvocation.InvocationName -ne '.') {
     Write-Host "Checking for updates..." -ForegroundColor Gray
     $global:UpdateAvailable = Check-For-Updates-Silent
     if ($global:UpdateAvailable) {
-        Write-Host "New version found: $($global:UpdateAvailable.NewVersion)" -ForegroundColor Green
-        Start-Sleep -Seconds 1
+        Write-Host ""
+        Write-Host "====================================================" -ForegroundColor Cyan
+        Write-Host "  NEW VERSION AVAILABLE" -ForegroundColor Green
+        Write-Host "  Current: $($global:UpdateAvailable.CurrentVersion)" -ForegroundColor White
+        Write-Host "  Remote:  $($global:UpdateAvailable.NewVersion)" -ForegroundColor Green
+        Write-Host "====================================================" -ForegroundColor Cyan
+        Write-Host ""
+        $updateChoice = Read-Host "Update now? (Y/n)"
+        if ($updateChoice -ne 'n') {
+            try {
+                $backupPath = "$($global:UpdateAvailable.ScriptPath).bak"
+                Copy-Item -Path $global:UpdateAvailable.ScriptPath -Destination $backupPath -Force
+                Write-Host "Backup saved to: $backupPath" -ForegroundColor Gray
+                Set-Content -Path $global:UpdateAvailable.ScriptPath -Value $global:UpdateAvailable.NewContent
+                Write-Host "Update successful! Restarting..." -ForegroundColor Green
+                Start-Sleep -Seconds 1
+                & $global:UpdateAvailable.ScriptPath
+                exit
+            } catch {
+                Write-Host "Update failed: $_" -ForegroundColor Red
+                Write-Host "Continuing with current version." -ForegroundColor Yellow
+                Start-Sleep -Seconds 2
+            }
+        } else {
+            Write-Host "Update skipped." -ForegroundColor DarkGray
+        }
     }
 
     while ($true) {
@@ -4366,16 +4854,10 @@ if ($MyInvocation.InvocationName -ne '.') {
         while ($true) {
             if ($global:RestartSessionSelection) { break }
 
-            $otaLabel = "Check for Updates (OTA)"
-            if ($global:UpdateAvailable) {
-                 $otaLabel += " [new version found: $($global:UpdateAvailable.NewVersion)]"
-            }
-
             $menuOptions = @(
                 "RDS Management",
                 "EC2 Management",
                 "AWS Sessions (Assume/Granted)",
-                $otaLabel,
                 "Quit"
             )
 
@@ -4387,8 +4869,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                 0 { Show-RDS-Menu }
                 1 { Show-EC2-Menu }
                 2 { Show-AWSSessions-Menu }
-                3 { Check-For-Updates-Interactive }
-                4 {
+                3 {
                     # Restore cursor before exit
                     try { [Console]::CursorVisible = $true } catch {}
                     Clear-Host
