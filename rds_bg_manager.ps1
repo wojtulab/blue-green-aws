@@ -10,6 +10,7 @@
 
 .CHANGELOG
     2026-02-18 (Part 2)
+    - FEATURE: `Monitor-RDS-State` now supports live name filtering (type to filter, Backspace to delete, ESC to clear) and PgUp/PgDn pagination for large instance lists.
     - FEATURE: Expanded `Monitor-BGStatus-Interactive` into a full dashboard with SwitchoverDetails table, Tasks checklist, Replica Lag, engine versions, elapsed time, and flicker-free rendering.
     - RELIABILITY: Fixed exponential backoff starting at 1s instead of 2s (`retryCount + 1`).
     - RELIABILITY: Migrated 8 raw `aws` CLI calls to `Invoke-AWS-WithRetry` for consistent throttling/SSO-token handling.
@@ -1503,25 +1504,64 @@ function Remove-EC2Snapshot-Interactive {
 }
 
 function Monitor-RDS-State {
-    Show-Header
-    Write-Host "Monitoring RDS Instance States..." -ForegroundColor Yellow
+    $filter = ""
+    $currentPage = 0
+    $sb = [System.Text.StringBuilder]::new()
+
+    try { [Console]::CursorVisible = $false } catch {}
 
     while ($true) {
         $instances = Get-CachedRDSInstances
 
-        # Render Frame — use cursor repositioning instead of Clear-Host to avoid flicker
-        try { [Console]::SetCursorPosition(0, 0) } catch {}
-        $headerLines = Get-Header-Lines
-        foreach ($hl in $headerLines) {
-            [Console]::WriteLine((Pad-Line $hl))
+        # Apply filter
+        $filtered = $instances
+        if ($filter.Length -gt 0 -and $instances) {
+            $filtered = @($instances | Where-Object { $_.DBInstanceIdentifier -like "*$filter*" })
         }
-        Write-Host "REAL-TIME INSTANCE STATE MONITOR (Press ENTER/ESC to return | F5 to Refresh)" -ForegroundColor Cyan
-        Write-Host "------------------------------------------------------------------------------------------------" -ForegroundColor DarkGray
-        Write-Host ("{0,-35} {1,-15} {2,-15} {3}" -f "Identifier", "Engine", "Status", "Endpoint")
-        Write-Host "------------------------------------------------------------------------------------------------" -ForegroundColor DarkGray
 
-        if ($instances) {
-            foreach ($inst in $instances) {
+        # Calculate pagination
+        try { $winHeight = $Host.UI.RawUI.WindowSize.Height } catch { $winHeight = 30 }
+        try { $winWidth = $Host.UI.RawUI.WindowSize.Width } catch { $winWidth = 120 }
+        $headerLines = Get-Header-Lines
+        $reservedLines = $headerLines.Count + 6  # title + separator + column header + separator + footer + filter bar
+        $pageSize = [math]::Max(5, $winHeight - $reservedLines)
+        $totalItems = if ($filtered) { $filtered.Count } else { 0 }
+        $totalPages = [math]::Max(1, [math]::Ceiling($totalItems / $pageSize))
+
+        # Clamp current page
+        if ($currentPage -ge $totalPages) { $currentPage = $totalPages - 1 }
+        if ($currentPage -lt 0) { $currentPage = 0 }
+
+        $startIdx = $currentPage * $pageSize
+        $endIdx = [math]::Min($startIdx + $pageSize, $totalItems) - 1
+
+        # --- Build frame ---
+        [void]$sb.Clear()
+
+        foreach ($hl in $headerLines) {
+            [void]$sb.AppendLine((Pad-Line $hl $winWidth))
+        }
+
+        # Title line with instance counts
+        $titleText = "  REAL-TIME INSTANCE STATE MONITOR"
+        if ($totalItems -ne ($instances | Measure-Object).Count) {
+            $titleText += "  (showing $totalItems of $(($instances | Measure-Object).Count))"
+        } else {
+            $titleText += "  ($totalItems instances)"
+        }
+        [void]$sb.AppendLine((Pad-Line (Get-AnsiString $titleText -Color Cyan) $winWidth))
+        [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  ────────────────────────────────────────────────────────────────────────────────────────────" -Color DarkGray) $winWidth))
+
+        # Column header
+        $colFmt = "  {0,-35} {1,-15} {2,-15} {3}"
+        [void]$sb.AppendLine((Pad-Line (Get-AnsiString ($colFmt -f "Identifier", "Engine", "Status", "Endpoint") -Color White) $winWidth))
+        [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  ────────────────────────────────────────────────────────────────────────────────────────────" -Color DarkGray) $winWidth))
+
+        # Instance rows
+        $rowsRendered = 0
+        if ($totalItems -gt 0) {
+            for ($ri = $startIdx; $ri -le $endIdx; $ri++) {
+                $inst = $filtered[$ri]
                 $status = $inst.DBInstanceStatus
                 $color = "White"
                 if ($status -eq "available") { $color = "Green" }
@@ -1529,37 +1569,112 @@ function Monitor-RDS-State {
                 elseif ($status -in @("creating", "starting", "modifying", "rebooting")) { $color = "Yellow" }
 
                 $endpoint = if ($inst.Endpoint) { $inst.Endpoint.Address } else { "-" }
-
-                Write-Host ("{0,-35} {1,-15} {2,-15} {3}" -f $inst.DBInstanceIdentifier, $inst.Engine, $status, $endpoint) -ForegroundColor $color
+                $rowText = $colFmt -f $inst.DBInstanceIdentifier, $inst.Engine, $status, $endpoint
+                [void]$sb.AppendLine((Pad-Line (Get-AnsiString $rowText -Color $color) $winWidth))
+                $rowsRendered++
             }
-        } else {
-            Write-Host "No instances found." -ForegroundColor Yellow
         }
 
-        # Input Loop
-        $loops = 100 # 10 seconds approx (100ms * 100)
-        $refresh = $false
+        # Pad remaining rows to fill page (prevents residual text)
+        for ($pad = $rowsRendered; $pad -lt $pageSize; $pad++) {
+            [void]$sb.AppendLine((Pad-Line "" $winWidth))
+        }
+
+        if ($totalItems -eq 0) {
+            if ($filter.Length -gt 0) {
+                [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  No instances matching filter." -Color Yellow) $winWidth))
+            } else {
+                [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  No instances found." -Color Yellow) $winWidth))
+            }
+        }
+
+        # Footer separator
+        [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  ────────────────────────────────────────────────────────────────────────────────────────────" -Color DarkGray) $winWidth))
+
+        # Filter bar
+        $filterDisplay = if ($filter.Length -gt 0) { "  Filter: $filter`_" } else { "  Type to filter by name" }
+        $filterColor = if ($filter.Length -gt 0) { "Yellow" } else { "DarkGray" }
+        [void]$sb.AppendLine((Pad-Line (Get-AnsiString $filterDisplay -Color $filterColor) $winWidth))
+
+        # Page indicator + controls
+        $refreshTime = Get-Date -Format "HH:mm:ss"
+        $pageInfo = "Page $($currentPage + 1)/$totalPages"
+        $controlsLine = "  $refreshTime | $pageInfo | PgUp/PgDn: Navigate | F5: Refresh | ESC: $(if ($filter.Length -gt 0) {'Clear Filter'} else {'Exit'})"
+        [void]$sb.AppendLine((Pad-Line (Get-AnsiString $controlsLine -Color DarkGray) $winWidth))
+
+        # Flush frame
+        try { [Console]::SetCursorPosition(0, 0) } catch {}
+        try { [Console]::Write($sb.ToString()) } catch {}
+
+        # --- Input Loop (10 seconds, responsive to keypresses) ---
+        $loops = 100
+        $needsRedraw = $false
 
         if ($global:TEST_RUN_ONCE) { $loops = 0 }
 
         for ($i = 0; $i -lt $loops; $i++) {
             if ([Console]::KeyAvailable) {
                 $k = [Console]::ReadKey($true)
-                if ($k.Key -eq 'Enter' -or $k.Key -eq 'Escape') { return }
+
+                if ($k.Key -eq 'Enter') {
+                    try { [Console]::CursorVisible = $true } catch {}
+                    return
+                }
+
+                if ($k.Key -eq 'Escape') {
+                    if ($filter.Length -gt 0) {
+                        $filter = ""
+                        $currentPage = 0
+                        $needsRedraw = $true
+                        break
+                    } else {
+                        try { [Console]::CursorVisible = $true } catch {}
+                        return
+                    }
+                }
+
                 if ($k.Key -eq 'F5') {
-                    $refresh = $true
+                    Get-CachedRDSInstances -Force | Out-Null
+                    $needsRedraw = $true
+                    break
+                }
+
+                if ($k.Key -eq 'PageUp') {
+                    if ($currentPage -gt 0) { $currentPage-- }
+                    $needsRedraw = $true
+                    break
+                }
+
+                if ($k.Key -eq 'PageDown') {
+                    if ($currentPage -lt ($totalPages - 1)) { $currentPage++ }
+                    $needsRedraw = $true
+                    break
+                }
+
+                if ($k.Key -eq 'Backspace') {
+                    if ($filter.Length -gt 0) {
+                        $filter = $filter.Substring(0, $filter.Length - 1)
+                        $currentPage = 0
+                        $needsRedraw = $true
+                        break
+                    }
+                }
+
+                # Printable characters → add to filter
+                if ($k.KeyChar -and $k.KeyChar -ge ' ') {
+                    $filter += $k.KeyChar
+                    $currentPage = 0
+                    $needsRedraw = $true
                     break
                 }
             }
             Start-Sleep -Milliseconds 100
         }
 
-        if ($refresh) {
-            Get-CachedRDSInstances -Force | Out-Null
-        }
-
         if ($global:TEST_RUN_ONCE) { break }
     }
+
+    try { [Console]::CursorVisible = $true } catch {}
 }
 
 function Show-RDS-Menu {
@@ -2013,7 +2128,7 @@ function Show-DatabaseLogs {
             $options += "Export List"
             $options += "Back"
             
-            $idx = Show-Menu -Title "Select Log File to View" -Options $options
+            $idx = Show-Menu -Title "Select Log File to View" -Options $options -EnableFilter
             
             # Back/Exit
             if ($idx -eq -1 -or $idx -eq ($options.Count - 1)) { return }
@@ -3034,7 +3149,7 @@ function Monitor-BGStatus-Interactive {
     $options = @($bgs | ForEach-Object { "$($_.BlueGreenDeploymentName) ($($_.BlueGreenDeploymentIdentifier)) [$($_.Status)]" })
     $options += "Cancel"
 
-    $idx = Show-Menu -Title "Select Deployment to Monitor" -Options $options
+    $idx = Show-Menu -Title "Select Deployment to Monitor" -Options $options -EnableFilter
     if ($idx -eq -1 -or $idx -eq ($options.Count - 1)) { return }
 
     $bgObj = $bgs[$idx]
@@ -3345,7 +3460,7 @@ function Remove-BGDeployment-Interactive {
 
     $options = @($bgs | ForEach-Object { "$($_.BlueGreenDeploymentName) ($($_.Status))" })
 
-    $idx = Show-Menu -Title "Select Blue/Green Deployment to DELETE" -Options $options
+    $idx = Show-Menu -Title "Select Blue/Green Deployment to DELETE" -Options $options -EnableFilter
 
     # Check return values carefully. Show-Menu returns index int.
     # If $idx is array (from MultiSelect?), take first. But MultiSelect is OFF here.
@@ -3507,7 +3622,7 @@ function Invoke-Switchover-Interactive {
     })
     $options += "Cancel"
 
-    $idx = Show-Menu -Title "Select Deployment to PROMOTE (Switchover)" -Options $options
+    $idx = Show-Menu -Title "Select Deployment to PROMOTE (Switchover)" -Options $options -EnableFilter
     if ($idx -eq ($options.Count - 1)) { return }
 
     $bgObj = $bgs[$idx]
