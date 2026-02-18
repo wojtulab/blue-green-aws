@@ -1,4 +1,4 @@
-# VERSION: 2026.02.18.03
+# VERSION: 2026.02.18.04
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,9 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-02-18 (Part 4)
+    - UI: Styled HTML report exports — dark blue header background (#1e3a5f), white header text, alternating row colors (white/#f2f4f7 zebra stripes), hover highlight effect. Added report title, generation timestamp, AWS profile, and row count footer.
+
     2026-02-18 (Part 3)
     - FEATURE: Pre-Switchover Checklist — 4-point validation (deployment status, tasks completion, replica lag ≤1s, engine versions) with `FORCE` override option.
     - FEATURE: CloudWatch Alarms Dashboard — fetches all alarms in `AWS/RDS` namespace, color-coded (ALARM/OK/INSUFFICIENT_DATA), with summary and CSV/HTML export.
@@ -1279,11 +1282,64 @@ function Export-Report {
         if ([string]::IsNullOrWhiteSpace($path)) { $path = $defaultPath }
 
         try {
-            # Eksport do CSV jest kluczowy / CSV export is crucial
             if ($format -eq "1") {
                 $Data | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
             } elseif ($format -eq "2") {
-                $Data | ConvertTo-Html | Out-File -FilePath $path -Encoding UTF8
+                # Build styled HTML report
+                $properties = @()
+                if ($Data[0] -is [PSCustomObject]) {
+                    $properties = @($Data[0].PSObject.Properties.Name)
+                } else {
+                    $properties = @($Data[0] | Get-Member -MemberType NoteProperty | Select-Object -ExpandProperty Name)
+                }
+
+                $htmlSb = [System.Text.StringBuilder]::new()
+                [void]$htmlSb.AppendLine(@"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>$DefaultFileName</title>
+<style>
+  body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background: #fafbfc; color: #333; }
+  h2 { color: #1e3a5f; margin-bottom: 4px; }
+  .meta { color: #888; font-size: 0.85em; margin-bottom: 16px; }
+  table { border-collapse: collapse; width: 100%; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+  th { background: #1e3a5f; color: #fff; padding: 10px 14px; text-align: left; font-weight: 600; border: 1px solid #16304d; }
+  td { padding: 8px 14px; border: 1px solid #dde1e6; }
+  tr:nth-child(even) { background: #f2f4f7; }
+  tr:nth-child(odd) { background: #ffffff; }
+  tr:hover { background: #e0ecf8; }
+  .footer { color: #888; font-size: 0.8em; margin-top: 12px; }
+</style>
+</head>
+<body>
+<h2>$DefaultFileName</h2>
+<div class="meta">Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Profile: $global:AWSProfile</div>
+<table>
+<thead><tr>
+"@)
+                foreach ($prop in $properties) {
+                    [void]$htmlSb.AppendLine("  <th>$([System.Web.HttpUtility]::HtmlEncode($prop))</th>")
+                }
+                [void]$htmlSb.AppendLine("</tr></thead>")
+                [void]$htmlSb.AppendLine("<tbody>")
+
+                foreach ($row in $Data) {
+                    [void]$htmlSb.Append("<tr>")
+                    foreach ($prop in $properties) {
+                        $val = $row.$prop
+                        if ($val -eq $null) { $val = "" }
+                        [void]$htmlSb.Append("<td>$([System.Web.HttpUtility]::HtmlEncode([string]$val))</td>")
+                    }
+                    [void]$htmlSb.AppendLine("</tr>")
+                }
+
+                [void]$htmlSb.AppendLine("</tbody></table>")
+                [void]$htmlSb.AppendLine("<div class='footer'>Rows: $($Data.Count) | AWS RDS Blue/Green Deployment Manager</div>")
+                [void]$htmlSb.AppendLine("</body></html>")
+
+                $htmlSb.ToString() | Out-File -FilePath $path -Encoding UTF8
             }
             Write-Host "Exported successfully to $path" -ForegroundColor Green
         } catch {
