@@ -20,7 +20,7 @@ Interactive PowerShell tool for managing AWS RDS instances, Blue/Green deploymen
 
 | Feature | Description |
 |---------|-------------|
-| **Create Blue/Green Deployment** | Interactive wizard with engine version and parameter group selection |
+| **Create Blue/Green Deployment** | Interactive wizard with engine version and parameter group selection; optimized pre-load (engine versions ~3-5s, parameter groups load in background) |
 | **Monitor Deployment Status** | Full dashboard: status, tasks checklist, replica lag, engine versions, elapsed time |
 | **Execute Switchover** | Promote Green to production with safety checks |
 | **Delete Blue/Green Deployment** | Pre-deletion replica lag check, auto-disable deletion protection |
@@ -160,7 +160,7 @@ External config file: **`rds_bg_manager.config.ps1`** (same directory as the scr
 ## Architecture
 
 ```
-rds_bg_manager.ps1          Main script (~4400 lines)
+rds_bg_manager.ps1          Main script (~5100 lines)
 rds_bg_manager.config.ps1   External configuration (optional)
 rds_manager_YYYYMMDD.log    Daily log file (auto-created)
 ```
@@ -173,6 +173,7 @@ rds_manager_YYYYMMDD.log    Daily log file (auto-created)
 - **Automatic SSO refresh** — detects expired tokens and prompts re-login
 - **OTA updates** — checks GitHub for new versions at startup (10s timeout)
 - **Parallel execution** — multi-snapshot and OS update use `ForEach-Object -Parallel` on PS7+
+- **Optimized Blue/Green pre-load** — two-stage background job: engine-version lookup (blocking, ~3-5s) + parameter-group lookup (non-blocking, runs while user selects version). Eliminates ~25s UI freeze on typical AWS call delays
 
 ---
 
