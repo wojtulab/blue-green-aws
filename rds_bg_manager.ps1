@@ -1,4 +1,4 @@
-# VERSION: 2026.02.18.04
+# VERSION: 2026.05.25.01
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,9 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-05-25
+    - PERFORMANCE: Optimized 'Create Blue/Green Deployment' pre-load sequence. Split pre-load job into two stages: engine-version lookup (fast path, ~3-5s wait) + parameter-group lookup (background job while user selects version). Reduced wait timeouts from 30s → 8s (engine) / 15s (upgrade versions) / 12s (parameter groups). Eliminates ~25s UI freeze during "Finalising pre-load..." for typical AWS call delays.
+
     2026-02-18 (Part 4)
     - UI: Styled HTML report exports — dark blue header background (#1e3a5f), white header text, alternating row colors (white/#f2f4f7 zebra stripes), hover highlight effect. Added report title, generation timestamp, AWS profile, and row count footer.
 
@@ -3450,10 +3453,11 @@ function New-BGDeployment-Interactive {
     $defaultBGName = "bg-deployment-$sourceDB"
 
     Write-Host "`n[Deployment Naming]" -ForegroundColor Cyan
-    Write-Host "Default Deployment Name: $defaultBGName" -ForegroundColor Gray
-    $inputName = Read-Host "Enter BG Deployment Name [Press Enter for default, 'q' to quit]"
-    if ($inputName -eq 'q') { return }
-    $bgName = if ([string]::IsNullOrWhiteSpace($inputName)) { $defaultBGName } else { $inputName }
+    Write-Host "Enter BG Deploy Name ['q' to quit]: " -NoNewline -ForegroundColor Cyan
+    [System.Console]::Write($defaultBGName)
+    $suffix = [System.Console]::ReadLine()
+    if ($suffix -eq 'q') { return }
+    $bgName = if ([string]::IsNullOrWhiteSpace($suffix)) { $defaultBGName } else { "$defaultBGName$suffix" }
 
     Write-Host "Green DB Identifier:     (Generated automatically by AWS)" -ForegroundColor Gray
     
