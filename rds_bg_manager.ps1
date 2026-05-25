@@ -1,4 +1,4 @@
-# VERSION: 2026.02.18.04
+# VERSION: 2026.05.18.04
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -240,11 +240,98 @@ function Get-InstanceIdFromArn {
     return $Arn
 }
 
+# --- CONSTANTS ---
+$script:MaxManualSnapshots = 100   # AWS account-level limit per region
+$script:CacheTTLSeconds    = 60    # RDS instance list cache duration
+$script:ViewportReserved   = 12    # Lines reserved for header/footer in viewport
+
+# --- SHARED HELPERS ---
+
+function Get-ReplicaLagSeconds {
+    param(
+        [string]$InstanceId,
+        [int]$LookbackMinutes = 10
+    )
+    if ([string]::IsNullOrWhiteSpace($InstanceId)) { return $null }
+    try {
+        $end   = (Get-Date).ToUniversalTime()
+        $start = $end.AddMinutes(-$LookbackMinutes)
+        $lagArgs = @(
+            "cloudwatch", "get-metric-statistics",
+            "--namespace", "AWS/RDS",
+            "--metric-name", "ReplicaLag",
+            "--dimensions", "Name=DBInstanceIdentifier,Value=$InstanceId",
+            "--start-time",  $start.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            "--end-time",    $end.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            "--period", "300", "--statistics", "Maximum",
+            "--output", "json", "--profile", $global:AWSProfile
+        )
+        $json = (Invoke-AWS-WithRetry -Arguments $lagArgs -ReturnJson) -join ""
+        if (![string]::IsNullOrWhiteSpace($json)) {
+            $data = $json | ConvertFrom-Json
+            if ($data.Datapoints -and $data.Datapoints.Count -gt 0) {
+                return ($data.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1).Maximum
+            }
+        }
+    } catch {}
+    return $null  # null = no data or error
+}
+
+function Confirm-SnapshotQuota {
+    param([int]$RequiredSlots = 1)
+    $max = $script:MaxManualSnapshots
+    while ($true) {
+        $current = Get-ManualSnapshotCount
+        if (($current + $RequiredSlots) -le $max) {
+            Write-Log "Quota OK: $current used + $RequiredSlots required <= $max limit." -ForegroundColor Green
+            return $true
+        }
+        Write-Host "WARNING: AWS Snapshot Quota Reached!" -ForegroundColor Red
+        Write-Host "You have $current/$max manual snapshots. Need $RequiredSlots more slot(s)." -ForegroundColor Yellow
+        $resp = Read-Host "Delete old snapshots, then press ENTER to re-check, or type 'Q' to quit"
+        if ($resp -eq 'Q' -or $resp -eq 'q') { return $false }
+    }
+}
+
+function Start-InstanceCacheWarmJob {
+    $age = if ($global:RDSInstancesCacheTime) { ((Get-Date) - $global:RDSInstancesCacheTime).TotalSeconds } else { 9999 }
+    if ($age -lt $script:CacheTTLSeconds) { return }
+    if ($global:RDSCacheWarmJob -and $global:RDSCacheWarmJob.State -eq 'Running') { return }
+    if ($global:RDSCacheWarmJob) { Remove-Job $global:RDSCacheWarmJob -Force -ErrorAction SilentlyContinue; $global:RDSCacheWarmJob = $null }
+    $prof = $global:AWSProfile
+    $global:RDSCacheWarmJob = Start-Job -ScriptBlock {
+        param($p)
+        try { (& aws rds describe-db-instances --query 'DBInstances[*]' --output json --profile $p 2>$null) -join "" } catch { "" }
+    } -ArgumentList $prof
+}
+
 function Get-CachedRDSInstances {
     param(
         [switch]$Force
     )
-    $cacheDuration = 60 # seconds
+    $cacheDuration = $script:CacheTTLSeconds
+
+    # Harvest background warm job if completed
+    if ($global:RDSCacheWarmJob) {
+        $jobState = $global:RDSCacheWarmJob.State
+        if ($jobState -eq 'Completed') {
+            try {
+                $warmJson = Receive-Job $global:RDSCacheWarmJob -ErrorAction SilentlyContinue
+                if (![string]::IsNullOrWhiteSpace($warmJson)) {
+                    $warmData = $warmJson | ConvertFrom-Json
+                    if ($warmData) {
+                        $global:RDSInstancesCache = if ($warmData -is [Array]) { $warmData } else { @($warmData) }
+                        $global:RDSInstancesCacheTime = Get-Date
+                    }
+                }
+            } catch {}
+            Remove-Job $global:RDSCacheWarmJob -Force -ErrorAction SilentlyContinue
+            $global:RDSCacheWarmJob = $null
+        } elseif ($jobState -in 'Failed', 'Stopped') {
+            Remove-Job $global:RDSCacheWarmJob -Force -ErrorAction SilentlyContinue
+            $global:RDSCacheWarmJob = $null
+        }
+    }
 
     $shouldRefresh = $true
     if ($global:RDSInstancesCache -and $global:RDSInstancesCacheTime) {
@@ -313,8 +400,7 @@ function global:Get-AnsiColor {
 function global:Get-AnsiString {
     param(
         [string]$Text,
-        [string]$Color = "White",
-        [string]$BgColor = $null
+        [string]$Color = "White"
     )
     $c = Get-AnsiColor $Color
     return "$c$Text$($global:ANSI.Reset)"
@@ -970,7 +1056,7 @@ function Remove-AWSProfile-Interactive {
         if (Test-Path $file) {
             try {
                 $lines = Get-Content $file
-                $newLines = @()
+                $newLines = [System.Collections.Generic.List[string]]::new()
                 $skip = $false
                 $foundInFile = $false
 
@@ -987,11 +1073,11 @@ function Remove-AWSProfile-Interactive {
                         # If we encounter next section start [..., stop skipping
                         if ($line -match "^\[.*\]") {
                             $skip = $false
-                            $newLines += $line
+                            $newLines.Add($line)
                         }
                         # Else: skip properties of the deleted profile
                     } else {
-                        $newLines += $line
+                        $newLines.Add($line)
                     }
                 }
 
@@ -1649,8 +1735,9 @@ function Monitor-RDS-State {
 
         # Title line with instance counts
         $titleText = "  REAL-TIME INSTANCE STATE MONITOR"
-        if ($totalItems -ne ($instances | Measure-Object).Count) {
-            $titleText += "  (showing $totalItems of $(($instances | Measure-Object).Count))"
+        $totalInstances = @($instances).Count
+        if ($totalItems -ne $totalInstances) {
+            $titleText += "  (showing $totalItems of $totalInstances)"
         } else {
             $titleText += "  ($totalItems instances)"
         }
@@ -1809,6 +1896,7 @@ function Monitor-RDS-State {
 }
 
 function Show-RDS-Menu {
+    Start-InstanceCacheWarmJob
     while ($true) {
         if ($global:RestartSessionSelection) { return }
 
@@ -2132,37 +2220,11 @@ function Show-BGReplicaLag {
         return
     }
 
-    $endTime = Get-Date
-    $startTime = $endTime.AddMinutes(-10)
-    $endStr = $endTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $startStr = $startTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $targetId = Get-InstanceIdFromArn $foundBG.Target
+    if ($targetId -eq $foundBG.Target) { $targetId = "Unknown" }  # ARN parse failed
 
-    # Extract DB Identifier from Target ARN
-    if ($foundBG.Target -match ":db:(.+)$") {
-        $targetId = $matches[1]
-    } else {
-        $targetId = "Unknown"
-    }
-
-    $lag = "N/A"
-    if ($targetId -ne "Unknown") {
-        try {
-            $metricArgs = @("cloudwatch", "get-metric-statistics", "--namespace", "AWS/RDS", "--metric-name", "ReplicaLag", "--dimensions", "Name=DBInstanceIdentifier,Value=$targetId", "--start-time", $startStr, "--end-time", $endStr, "--period", "600", "--statistics", "Maximum", "--output", "json", "--profile", $global:AWSProfile)
-            $metricOutput = Invoke-AWS-WithRetry -Arguments $metricArgs -ReturnJson
-            $metricJson = $metricOutput -join ""
-            if (![string]::IsNullOrWhiteSpace($metricJson)) {
-                $metricData = $metricJson | ConvertFrom-Json
-                if ($metricData.Datapoints) {
-                    $point = $metricData.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1
-                    $lag = $point.Maximum
-                } else {
-                    $lag = "No Data"
-                }
-            }
-        } catch {
-            $lag = "Error"
-        }
-    }
+    $lagRaw = if ($targetId -ne "Unknown") { Get-ReplicaLagSeconds -InstanceId $targetId -LookbackMinutes 10 } else { $null }
+    $lag = if ($lagRaw -ne $null) { $lagRaw } else { "No Data" }
 
     Write-Host "BG Deployment:  $($foundBG.BlueGreenDeploymentName)" -ForegroundColor White
     Write-Host "Green DB:       $targetId" -ForegroundColor White
@@ -2717,27 +2779,7 @@ function New-RDSSnapshot-Interactive {
 
     $selectedID = $global:SelectedInstance.DBInstanceIdentifier
 
-    # --- QUOTA CHECK ---
-    $maxManualSnapshots = 100
-    $requiredSlots = 1
-
-    while ($true) {
-        $currentCount = Get-ManualSnapshotCount
-
-        if (($currentCount + $requiredSlots) -le $maxManualSnapshots) {
-            Write-Log "Quota Check Passed: $currentCount manual snapshots used. Slots available." -ForegroundColor Green
-            break
-        } else {
-            Write-Host "WARNING: AWS Quota Limit Reached!" -ForegroundColor Red
-            Write-Host "You have $currentCount manual snapshots (Limit: $maxManualSnapshots). You need $requiredSlots slot(s)." -ForegroundColor Yellow
-
-            $resp = Read-Host "Please delete old snapshots manually. Press ENTER to re-check, or type 'Q' to quit"
-            if ($resp -eq 'Q' -or $resp -eq 'q') {
-                return
-            }
-        }
-    }
-    # -------------------
+    if (-not (Confirm-SnapshotQuota -RequiredSlots 1)) { return }
 
     Write-Host "Creating snapshot for active instance: $selectedID" -ForegroundColor Green
 
@@ -2805,27 +2847,7 @@ function New-MultipleRDSSnapshots-Interactive {
         return
     }
 
-    # --- QUOTA CHECK ---
-    $maxManualSnapshots = 100
-    $requiredSlots = $selectedIndices.Count
-
-    while ($true) {
-        $currentCount = Get-ManualSnapshotCount
-
-        if (($currentCount + $requiredSlots) -le $maxManualSnapshots) {
-             Write-Log "Quota Check Passed: $currentCount used + $requiredSlots required <= $maxManualSnapshots Limit." -ForegroundColor Green
-             break
-        } else {
-             Write-Host "WARNING: AWS Quota Limit Reached!" -ForegroundColor Red
-             Write-Host "You have $currentCount manual snapshots (Limit: $maxManualSnapshots). You need $requiredSlots slot(s)." -ForegroundColor Yellow
-
-             $resp = Read-Host "Please delete old snapshots manually. Press ENTER to re-check, or type 'Q' to quit"
-             if ($resp -eq 'Q' -or $resp -eq 'q') {
-                 return
-             }
-        }
-    }
-    # -------------------
+    if (-not (Confirm-SnapshotQuota -RequiredSlots $selectedIndices.Count)) { return }
 
     Show-Header
     Write-Host "SELECTED INSTANCES FOR SNAPSHOT:" -ForegroundColor Green
@@ -2930,7 +2952,7 @@ function New-MultipleRDSSnapshots-Interactive {
                 if ($isQuotaIssue) {
                     Write-Host "QUOTA LIMIT EXCEEDED" -ForegroundColor Red -BackgroundColor Yellow
                     Write-Host "The AWS manual snapshot limit has been reached." -ForegroundColor Yellow
-                    Write-Host "Current quota: $maxManualSnapshots manual snapshots per account/region." -ForegroundColor Yellow
+                    Write-Host "Current quota: $($script:MaxManualSnapshots) manual snapshots per account/region." -ForegroundColor Yellow
                     Write-Host ""
                     Write-Host "RECOMMENDED ACTION:" -ForegroundColor Cyan
                     Write-Host "  1. Go to Snapshot Management -> Delete Snapshots" -ForegroundColor White
@@ -2956,8 +2978,8 @@ function New-MultipleRDSSnapshots-Interactive {
 
                     # Re-check quota before retry
                     $currentCount = Get-ManualSnapshotCount
-                    if (($currentCount + $currentTaskList.Count) -gt $maxManualSnapshots) {
-                        Write-Host "WARNING: Quota still insufficient! $currentCount used + $($currentTaskList.Count) required > $maxManualSnapshots limit." -ForegroundColor Red
+                    if (($currentCount + $currentTaskList.Count) -gt $script:MaxManualSnapshots) {
+                        Write-Host "WARNING: Quota still insufficient! $currentCount used + $($currentTaskList.Count) required > $($script:MaxManualSnapshots) limit." -ForegroundColor Red
                         Write-Host "Please delete old snapshots first." -ForegroundColor Yellow
                         $retrySnapshots = $false
                         Read-Host "Press Enter to menu..."
@@ -3163,65 +3185,183 @@ function New-BGDeployment-Interactive {
         return
     }
 
-    # Use new Live Filter Menu
-    $sourceObj = Select-RDSInstance-Live -Instances $instances -Title "Step 1: Select Source DB for Blue/Green Deployment"
-    if (!$sourceObj) { return }
+    # Pre-load engine versions for every unique engine combo in the fleet.
+    # Only fetches describe-db-engine-versions here; PG lookup starts separately once we know the family.
+    $preloadJobs = @{}
+    $uniqueEngines = @($instances | Select-Object -Property Engine, EngineVersion -Unique)
+    foreach ($e in $uniqueEngines) {
+        $key = "$($e.Engine)|$($e.EngineVersion)"
+        $eng = $e.Engine; $ver = $e.EngineVersion; $prof = $global:AWSProfile
+        try {
+            $preloadJobs[$key] = Start-Job -ScriptBlock {
+                param($eng, $ver, $prof)
+                $r = @{ EngJson = ""; Family = "" }
+                try {
+                    $r.EngJson = (& aws rds describe-db-engine-versions --engine $eng --engine-version $ver --include-all --output json --profile $prof 2>$null) -join ""
+                    if ($r.EngJson) {
+                        $d = $r.EngJson | ConvertFrom-Json
+                        $r.Family = if ($d.DBEngineVersions) { [string]$d.DBEngineVersions[0].DBParameterGroupFamily } else { "" }
+                    }
+                } catch {}
+                return $r
+            } -ArgumentList $eng, $ver, $prof
+        } catch {}
+    }
 
-    # Source ARN is required for --source
+    # Instance picker — pre-load jobs run in background during user interaction
+    $sourceObj = Select-RDSInstance-Live -Instances $instances -Title "Step 1: Select Source DB for Blue/Green Deployment"
+
+    if (!$sourceObj) {
+        $preloadJobs.Values | ForEach-Object { Remove-Job $_ -Force -ErrorAction SilentlyContinue }
+        return
+    }
+
     $sourceARN = $sourceObj.DBInstanceArn
-    $sourceDB = $sourceObj.DBInstanceIdentifier
-    $engine = $sourceObj.Engine.Trim()
+    $sourceDB  = $sourceObj.DBInstanceIdentifier
+    $engine    = $sourceObj.Engine.Trim()
     $currentVer = $sourceObj.EngineVersion.Trim()
 
     Show-Header
     Write-Host "Configuration for Source: $sourceDB ($engine $currentVer)" -ForegroundColor Cyan
 
-    # 2. Target Version Selection
-    Write-Log "Fetching valid upgrade targets..." -ForegroundColor Green
-    $targetVer = $null
+    # Harvest pre-loaded engine version data for the selected engine combo
+    $preloadKey = "$engine|$currentVer"
+    $engJson = ""; $currentFamily = ""; $preloadedPgJson = ""
+    $preloadPgJob = $null  # background PG job started once family is known
 
-    try {
-        # Added --include-all to ensure we find the version even if it's not the default
-        $engArgs = @("rds", "describe-db-engine-versions", "--engine", $engine, "--engine-version", $currentVer, "--include-all", "--output", "json", "--profile", $global:AWSProfile)
-        $json = (Invoke-AWS-WithRetry -Arguments $engArgs -ReturnJson) -join ""
-        if (![string]::IsNullOrWhiteSpace($json)) {
-             $data = $json | ConvertFrom-Json
-             $validUpgrades = $data.DBEngineVersions.ValidUpgradeTarget
+    if ($preloadJobs.ContainsKey($preloadKey)) {
+        $job = $preloadJobs[$preloadKey]
+        $preloadJobs.Remove($preloadKey)
+        $preloadJobs.Values | ForEach-Object { Remove-Job $_ -Force -ErrorAction SilentlyContinue }
+        $preloadJobs.Clear()
 
-             $upgradeOptions = @()
-             # Option 0: Keep Current
-             $upgradeOptions += "Keep Current ($currentVer)"
-
-             if ($validUpgrades) {
-                 foreach ($up in $validUpgrades) {
-                     $upgradeOptions += "$($up.EngineVersion) $(if($up.IsMajorVersionUpgrade){'[MAJOR]'}else{'[minor]'}) - $($up.Description)"
-                 }
-             }
-
-             $selIndices = Show-Menu -Title "Select Target Engine Version (SPACE to Select, ENTER to Confirm, ESC to Cancel)" -Options $upgradeOptions -EnableFilter -MultiSelect -MaxSelectionCount 1
-
-             # Handle ESC or F1 (return -99)
-             if ($selIndices -eq -99) { $global:RestartSessionSelection = $true; return } # F1
-             if ($selIndices -eq -1) { return } # ESC if single select? But multiselect returns array or empty.
-             # Wait, Show-Menu returns array for MultiSelect only if Enter pressed. If ESC, it might return empty or logic differs?
-             # Show-Menu (multiselect) logic: if ESC -> returns -1 (actually logic in switch 27 -> return -1).
-             # But return type is usually array. If -1 returned, it's not array.
-             # Let's check type.
-             if ($selIndices -is [int] -and $selIndices -lt 0) { return }
-
-             if ($selIndices.Count -gt 0) {
-                 $idxVer = $selIndices[0]
-                 if ($idxVer -eq 0) {
-                     $targetVer = $null # Keep Current
-                 } else {
-                     $targetVer = $validUpgrades[$idxVer - 1].EngineVersion
-                 }
-             } else {
-                 $targetVer = $null
-             }
+        if ($job.State -ne 'Completed') {
+            Write-Log "Finalising pre-load..." -ForegroundColor DarkGray
         }
-    } catch {
-        Write-Log "Error fetching versions: $_" -ForegroundColor Red
+        $job | Wait-Job -Timeout 8 | Out-Null
+        try {
+            $r = Receive-Job $job -ErrorAction SilentlyContinue
+            $engJson       = $r.EngJson
+            $currentFamily = $r.Family
+        } catch {}
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    } else {
+        $preloadJobs.Values | ForEach-Object { Remove-Job $_ -Force -ErrorAction SilentlyContinue }
+        $preloadJobs.Clear()
+    }
+
+    # Start PG lookup in background now that we know the family; runs while user picks a version
+    if ($currentFamily) {
+        $pgFam = $currentFamily; $pgProf = $global:AWSProfile
+        try {
+            $preloadPgJob = Start-Job -ScriptBlock {
+                param($fam, $prof)
+                (& aws rds describe-db-parameter-groups --filters "Name=db-parameter-group-family,Values=$fam" --output json --profile $prof 2>$null) -join ""
+            } -ArgumentList $pgFam, $pgProf
+        } catch {}
+    }
+
+    # Fallback sync fetch for engine versions if pre-load failed
+    if ([string]::IsNullOrWhiteSpace($engJson)) {
+        Write-Log "Fetching valid upgrade targets..." -ForegroundColor Green
+        try {
+            $engArgs = @("rds", "describe-db-engine-versions", "--engine", $engine, "--engine-version", $currentVer, "--include-all", "--output", "json", "--profile", $global:AWSProfile)
+            $engJson = (Invoke-AWS-WithRetry -Arguments $engArgs -ReturnJson) -join ""
+        } catch {}
+    }
+
+    # 2. Target Version Selection
+    $targetVer = $null
+    $validUpgrades = $null
+
+    if (![string]::IsNullOrWhiteSpace($engJson)) {
+        try {
+            $data = $engJson | ConvertFrom-Json
+            $validUpgrades = $data.DBEngineVersions.ValidUpgradeTarget
+            if (!$currentFamily -and $data.DBEngineVersions) {
+                $currentFamily = [string]$data.DBEngineVersions[0].DBParameterGroupFamily
+            }
+
+            $upgradeOptions = @("Keep Current ($currentVer)")
+            if ($validUpgrades) {
+                foreach ($up in $validUpgrades) {
+                    $upgradeOptions += "$($up.EngineVersion) $(if($up.IsMajorVersionUpgrade){'[MAJOR]'}else{'[minor]'}) - $($up.Description)"
+                }
+            }
+
+            # Start one background job per unique upgrade version BEFORE showing the version picker.
+            # Each job: describe-db-engine-versions(targetVer) → family → describe-db-parameter-groups(family)
+            # These run while the user reads and picks a version.
+            $upgradePgJobs = @{}  # key: EngineVersion string
+            if ($validUpgrades) {
+                $seenFamilies = @{}
+                foreach ($up in $validUpgrades) {
+                    $upVer = $up.EngineVersion; $upEng = $engine; $upProf = $global:AWSProfile
+                    try {
+                        $upgradePgJobs[$upVer] = Start-Job -ScriptBlock {
+                            param($eng, $ver, $prof)
+                            $r = @{ Family = ""; PgJson = "" }
+                            try {
+                                $vJson = (& aws rds describe-db-engine-versions --engine $eng --engine-version $ver --include-all --output json --profile $prof 2>$null) -join ""
+                                if ($vJson) {
+                                    $vd = $vJson | ConvertFrom-Json
+                                    $r.Family = if ($vd.DBEngineVersions) { [string]$vd.DBEngineVersions[0].DBParameterGroupFamily } else { "" }
+                                }
+                                if ($r.Family) {
+                                    $r.PgJson = (& aws rds describe-db-parameter-groups --filters "Name=db-parameter-group-family,Values=$($r.Family)" --output json --profile $prof 2>$null) -join ""
+                                }
+                            } catch {}
+                            return $r
+                        } -ArgumentList $upEng, $upVer, $upProf
+                    } catch {}
+                }
+            }
+
+            # User picks version — upgrade jobs run in background during this
+            $selIndices = Show-Menu -Title "Select Target Engine Version (SPACE to Select, ENTER to Confirm, ESC to Cancel)" -Options $upgradeOptions -EnableFilter -MultiSelect -MaxSelectionCount 1
+
+            if ($selIndices -eq -99) {
+                $upgradePgJobs.Values | ForEach-Object { Remove-Job $_ -Force -ErrorAction SilentlyContinue }
+                if ($preloadPgJob) { Remove-Job $preloadPgJob -Force -ErrorAction SilentlyContinue }
+                $global:RestartSessionSelection = $true; return
+            }
+            if ($selIndices -is [int] -and $selIndices -lt 0) {
+                $upgradePgJobs.Values | ForEach-Object { Remove-Job $_ -Force -ErrorAction SilentlyContinue }
+                if ($preloadPgJob) { Remove-Job $preloadPgJob -Force -ErrorAction SilentlyContinue }
+                return
+            }
+
+            if ($selIndices.Count -gt 0) {
+                $idxVer = $selIndices[0]
+                $targetVer = if ($idxVer -eq 0) { $null } else { $validUpgrades[$idxVer - 1].EngineVersion }
+            }
+
+            # Harvest the job for the chosen version; discard the rest
+            if ($targetVer -and $upgradePgJobs.ContainsKey($targetVer)) {
+                $chosenJob = $upgradePgJobs[$targetVer]
+                $upgradePgJobs.Remove($targetVer)
+                $upgradePgJobs.Values | ForEach-Object { Remove-Job $_ -Force -ErrorAction SilentlyContinue }
+                # Cancel the current-version PG job — the upgrade job covers the target family
+                if ($preloadPgJob) { Remove-Job $preloadPgJob -Force -ErrorAction SilentlyContinue; $preloadPgJob = $null }
+                $chosenJob | Wait-Job -Timeout 15 | Out-Null
+                try {
+                    $jr = Receive-Job $chosenJob -ErrorAction SilentlyContinue
+                    if ($jr.Family)  { $currentFamily    = $jr.Family }
+                    if ($jr.PgJson) { $preloadedPgJson  = $jr.PgJson }
+                } catch {}
+                Remove-Job $chosenJob -Force -ErrorAction SilentlyContinue
+            } else {
+                $upgradePgJobs.Values | ForEach-Object { Remove-Job $_ -Force -ErrorAction SilentlyContinue }
+            }
+
+        } catch {
+            Write-Log "Error processing version data: $_" -ForegroundColor Red
+            $in = Read-Host "Enter Target Version manually (or Enter to keep current, 'q' to quit)"
+            if ($in -eq 'q') { return }
+            $targetVer = if ([string]::IsNullOrWhiteSpace($in)) { $null } else { $in }
+        }
+    } else {
+        Write-Log "Error fetching versions: no data returned" -ForegroundColor Red
         $in = Read-Host "Enter Target Version manually (or Enter to keep current, 'q' to quit)"
         if ($in -eq 'q') { return }
         $targetVer = if ([string]::IsNullOrWhiteSpace($in)) { $null } else { $in }
@@ -3231,72 +3371,63 @@ function New-BGDeployment-Interactive {
     Write-Host "Target Version Selected: $displayVer" -ForegroundColor Green
     Start-Sleep -Seconds 1
 
-    # 3. Parameter Group Selection
-    $targetFamily = $null
-    $verToQuery = if ($targetVer) { $targetVer } else { $currentVer }
-
-    Write-Log "Fetching parameter groups for $engine $verToQuery..." -ForegroundColor Green
+    # 3. Parameter Group Selection — $preloadedPgJson and $currentFamily already contain the right data
     $pgName = $null
+    $targetFamily = $currentFamily
 
-    try {
-        # Get Family
-        $famArgs = @("rds", "describe-db-engine-versions", "--engine", $engine, "--engine-version", $verToQuery, "--include-all", "--output", "json", "--profile", $global:AWSProfile)
-        $famJson = (Invoke-AWS-WithRetry -Arguments $famArgs -ReturnJson) -join ""
-        if (![string]::IsNullOrWhiteSpace($famJson)) {
-            $famData = $famJson | ConvertFrom-Json
-            if ($famData.DBEngineVersions) {
-                $targetFamily = $famData.DBEngineVersions[0].DBParameterGroupFamily
+    if ($targetFamily) {
+        $pgJson = $preloadedPgJson
+
+        # Harvest background PG job started after engine-version pre-load
+        if ([string]::IsNullOrWhiteSpace($pgJson) -and $preloadPgJob) {
+            if ($preloadPgJob.State -ne 'Completed') {
+                Write-Log "Loading parameter groups..." -ForegroundColor DarkGray
+            }
+            $preloadPgJob | Wait-Job -Timeout 12 | Out-Null
+            try { $pgJson = Receive-Job $preloadPgJob -ErrorAction SilentlyContinue } catch {}
+            Remove-Job $preloadPgJob -Force -ErrorAction SilentlyContinue
+            $preloadPgJob = $null
+        }
+
+        # Fallback sync fetch only if both background paths failed
+        if ([string]::IsNullOrWhiteSpace($pgJson)) {
+            Write-Log "Fetching parameter groups for $engine ($targetFamily)..." -ForegroundColor Green
+            try {
+                $pgArgs = @("rds", "describe-db-parameter-groups", "--filters", "Name=db-parameter-group-family,Values=$targetFamily", "--output", "json", "--profile", $global:AWSProfile)
+                $pgJson = (Invoke-AWS-WithRetry -Arguments $pgArgs -ReturnJson) -join ""
+            } catch {
+                $err = $_
+                Write-Log "Error fetching parameter groups: $($err.Exception.Message)" -ForegroundColor Red
+                Write-Log "Full Error: $($err | Out-String)" -ForegroundColor DarkGray
             }
         }
 
-        if ($targetFamily) {
-             # Get Parameter Groups by Family
-             $pgArgs = @("rds", "describe-db-parameter-groups", "--filters", "Name=db-parameter-group-family,Values=$targetFamily", "--output", "json", "--profile", $global:AWSProfile)
-             $pgJson = (Invoke-AWS-WithRetry -Arguments $pgArgs -ReturnJson) -join ""
-             if (![string]::IsNullOrWhiteSpace($pgJson)) {
-                 $pgData = $pgJson | ConvertFrom-Json
-                 $pgs = $pgData.DBParameterGroups
+        if (![string]::IsNullOrWhiteSpace($pgJson)) {
+            try {
+                $pgData = $pgJson | ConvertFrom-Json
+                $pgs = $pgData.DBParameterGroups
+                if ($pgs) {
+                    $pgOptions = @("Default (Use Source's Group or Engine Default)")
+                    foreach ($p in $pgs) { $pgOptions += "$($p.DBParameterGroupName) ($($p.Description))" }
 
-                 if ($pgs) {
-                     $pgOptions = @()
-                     $pgOptions += "Default (Use Source's Group or Engine Default)"
+                    $selPGIndices = Show-Menu -Title "Select Parameter Group (Family: $targetFamily)" -Options $pgOptions -EnableFilter -MultiSelect -MaxSelectionCount 1
 
-                     foreach ($p in $pgs) {
-                         $pgOptions += "$($p.DBParameterGroupName) ($($p.Description))"
-                     }
+                    if ($selPGIndices -eq -99) { $global:RestartSessionSelection = $true; return }
+                    if ($selPGIndices -is [int] -and $selPGIndices -lt 0) { return }
 
-                     $selPGIndices = Show-Menu -Title "Select Parameter Group (Family: $targetFamily)" -Options $pgOptions -EnableFilter -MultiSelect -MaxSelectionCount 1
-
-                     if ($selPGIndices -eq -99) { $global:RestartSessionSelection = $true; return }
-                     if ($selPGIndices -is [int] -and $selPGIndices -lt 0) { return }
-
-                     if ($selPGIndices.Count -gt 0) {
-                         $idxPG = $selPGIndices[0]
-                         if ($idxPG -gt 0) {
-                             $pgName = $pgs[$idxPG - 1].DBParameterGroupName
-                         }
-                     }
-                 }
-             }
-        } else {
-            Write-Log "Could not determine parameter group family automatically." -ForegroundColor Yellow
-            # Enhanced Logging for debugging
-            Write-Log "DEBUG: Version Data for Family Determination: $($famJson | Out-String)" -ForegroundColor DarkGray
-
-            $manualPG = Read-Host "Enter Parameter Group Name manually [Press Enter for Default]"
-            if (![string]::IsNullOrWhiteSpace($manualPG)) {
-                $pgName = $manualPG
+                    if ($selPGIndices.Count -gt 0) {
+                        $idxPG = $selPGIndices[0]
+                        if ($idxPG -gt 0) { $pgName = $pgs[$idxPG - 1].DBParameterGroupName }
+                    }
+                }
+            } catch {
+                Write-Log "Error parsing parameter groups: $_" -ForegroundColor Red
             }
         }
-    } catch {
-        $err = $_
-        Write-Log "Error fetching parameter groups: $($err.Exception.Message)" -ForegroundColor Red
-        Write-Log "Full Error: $($err | Out-String)" -ForegroundColor DarkGray
-
+    } else {
+        Write-Log "Could not determine parameter group family automatically." -ForegroundColor Yellow
         $manualPG = Read-Host "Enter Parameter Group Name manually [Press Enter for Default]"
-        if (![string]::IsNullOrWhiteSpace($manualPG)) {
-            $pgName = $manualPG
-        }
+        if (![string]::IsNullOrWhiteSpace($manualPG)) { $pgName = $manualPG }
     }
 
     $displayPG = if ($pgName) { $pgName } else { "Default" }
@@ -3468,30 +3599,10 @@ function Monitor-BGStatus-Interactive {
         }
 
         # --- Fetch Replica Lag (non-blocking, best-effort) ---
-        $lag = "N/A"
-        if ($bg.Status -ne "PROVISIONING" -and $targetId -ne "Unknown") {
-            try {
-                $endTime = Get-Date
-                $startTime = $endTime.AddMinutes(-10)
-                $endStr = $endTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-                $startStr = $startTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-                $lagArgs = @("cloudwatch", "get-metric-statistics", "--namespace", "AWS/RDS", "--metric-name", "ReplicaLag", "--dimensions", "Name=DBInstanceIdentifier,Value=$targetId", "--start-time", $startStr, "--end-time", $endStr, "--period", "300", "--statistics", "Maximum", "--output", "json", "--profile", $global:AWSProfile)
-                $lagOut = Invoke-AWS-WithRetry -Arguments $lagArgs -ReturnJson
-                $lagJson = $lagOut -join ""
-                if (![string]::IsNullOrWhiteSpace($lagJson)) {
-                    $lagData = $lagJson | ConvertFrom-Json
-                    if ($lagData.Datapoints -and $lagData.Datapoints.Count -gt 0) {
-                        $point = $lagData.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1
-                        $lag = "$($point.Maximum)s"
-                    } else {
-                        $lag = "No Data"
-                    }
-                }
-            } catch {
-                $lag = "Error"
-            }
-        }
+        $lagRaw = if ($bg.Status -ne "PROVISIONING" -and $targetId -ne "Unknown") {
+            Get-ReplicaLagSeconds -InstanceId $targetId -LookbackMinutes 10
+        } else { $null }
+        $lag = if ($lagRaw -ne $null) { "${lagRaw}s" } else { if ($bg.Status -eq "PROVISIONING") { "N/A" } else { "No Data" } }
 
         # --- Build frame ---
         try { $winWidth = $Host.UI.RawUI.WindowSize.Width } catch { $winWidth = 120 }
@@ -3762,41 +3873,9 @@ function Remove-BGDeployment-Interactive {
     elseif ($instIdx -eq 2) { $instanceToDelete = $targetId }
 
     # Fetch Replica Lag for Safety Check
-    $endTime = Get-Date
-    $startTime = $endTime.AddMinutes(-15)
-    $endStr = $endTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $startStr = $startTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-    $sourceLag = "Unknown"
-    $targetLag = "Unknown"
-
-    foreach ($pair in @(@{ID=$sourceId; Ref=[ref]$sourceLag; IsPrimary=$true}, @{ID=$targetId; Ref=[ref]$targetLag; IsPrimary=$false})) {
-        if ($pair.IsPrimary) {
-            # Source is the primary — ReplicaLag metric doesn't exist for it
-            $pair.Ref.Value = "N/A (Primary)"
-            continue
-        }
-        if ($pair.ID) {
-            try {
-                $lagArgs = @("cloudwatch", "get-metric-statistics", "--namespace", "AWS/RDS", "--metric-name", "ReplicaLag", "--dimensions", "Name=DBInstanceIdentifier,Value=$($pair.ID)", "--start-time", $startStr, "--end-time", $endStr, "--period", "300", "--statistics", "Maximum", "--output", "json", "--profile", $global:AWSProfile)
-                $lagOut = Invoke-AWS-WithRetry -Arguments $lagArgs -ReturnJson
-                $lagJson = $lagOut -join ""
-                if (![string]::IsNullOrWhiteSpace($lagJson)) {
-                    $lagData = $lagJson | ConvertFrom-Json
-                    if ($lagData.Datapoints -and $lagData.Datapoints.Count -gt 0) {
-                        $point = $lagData.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1
-                        $pair.Ref.Value = "$($point.Maximum) sec"
-                    } else {
-                        $pair.Ref.Value = "No Data (Last 15m)"
-                    }
-                } else {
-                    $pair.Ref.Value = "No Data (Last 15m)"
-                }
-            } catch {
-                $pair.Ref.Value = "Error fetching"
-            }
-        }
-    }
+    $sourceLag = "N/A (Primary)"
+    $lagRaw = Get-ReplicaLagSeconds -InstanceId $targetId -LookbackMinutes 15
+    $targetLag = if ($lagRaw -ne $null) { "$lagRaw sec" } else { "No Data (Last 15m)" }
 
     Show-Header
     Write-Host "CONFIRM DELETION" -ForegroundColor Red
@@ -4078,6 +4157,7 @@ function Invoke-Switchover-Interactive {
     $checksPassed = 0
     $checksTotal = 4
     $hasCriticalFailure = $false
+    $autoSwitchover = $false
 
     # --- CHECK 1: Deployment Status ---
     Write-Host -NoNewline "  [1/4] Deployment Status: "
@@ -4112,34 +4192,49 @@ function Invoke-Switchover-Interactive {
 
     # --- CHECK 3: Replica Lag ---
     Write-Host -NoNewline "  [3/4] Replica Lag:       "
-    $lagSeconds = $null
-    if ($targetId) {
-        try {
-            $endTime = Get-Date
-            $startTime = $endTime.AddMinutes(-15)
-            $endStr = $endTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            $startStr = $startTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $lagSeconds = if ($targetId) { Get-ReplicaLagSeconds -InstanceId $targetId -LookbackMinutes 15 } else { $null }
 
-            $lagArgs = @("cloudwatch", "get-metric-statistics", "--namespace", "AWS/RDS", "--metric-name", "ReplicaLag", "--dimensions", "Name=DBInstanceIdentifier,Value=$targetId", "--start-time", $startStr, "--end-time", $endStr, "--period", "300", "--statistics", "Maximum", "--output", "json", "--profile", $global:AWSProfile)
-            $lagOut = (Invoke-AWS-WithRetry -Arguments $lagArgs -ReturnJson) -join ""
-            if (![string]::IsNullOrWhiteSpace($lagOut)) {
-                $lagData = $lagOut | ConvertFrom-Json
-                if ($lagData.Datapoints -and $lagData.Datapoints.Count -gt 0) {
-                    $point = $lagData.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1
-                    $lagSeconds = $point.Maximum
-                }
+    if ($lagSeconds -ne $null -and $lagSeconds -gt 1) {
+        Write-Host "${lagSeconds}s ⚠ (WARNING: >1s)" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Switchover zablokowany — replica lag musi spasc do <=1s." -ForegroundColor Yellow
+        Write-Host "  [R] Sprawdz ponownie teraz" -ForegroundColor Cyan
+        Write-Host "  [W] Monitoruj co 10s — auto-switchover gdy lag <=1s" -ForegroundColor Cyan
+        Write-Host "  [A] Przerwij" -ForegroundColor Red
+        Write-Host ""
+        $lagChoice = (Read-Host "  Wybor [R/W/A]").ToUpper()
+
+        if ($lagChoice -eq 'W') {
+            Write-Host ""
+            Write-Host "  Monitorowanie replica lag co 10s. Ctrl+C aby przerwac..." -ForegroundColor Cyan
+            $watchLag = $lagSeconds
+            while ($watchLag -gt 1) {
+                Write-Host "  Lag: ${watchLag}s — oczekiwanie..." -ForegroundColor Yellow
+                Start-Sleep -Seconds 10
+                $newLag = Get-ReplicaLagSeconds -InstanceId $targetId -LookbackMinutes 5
+                $watchLag = if ($newLag -ne $null) { $newLag } else { $watchLag }
             }
-        } catch {}
-    }
-
-    if ($lagSeconds -ne $null) {
-        if ($lagSeconds -le 1) {
-            Write-Host "${lagSeconds}s ✓" -ForegroundColor Green
+            Write-Host "  Lag: ${watchLag}s ✓ — auto-switchover zostanie wykonany" -ForegroundColor Green
             $checksPassed++
+            $autoSwitchover = $true
+        } elseif ($lagChoice -eq 'R') {
+            $lagSeconds = Get-ReplicaLagSeconds -InstanceId $targetId -LookbackMinutes 5
+            if ($lagSeconds -ne $null -and $lagSeconds -le 1) {
+                Write-Host "  Lag: ${lagSeconds}s ✓" -ForegroundColor Green
+                $checksPassed++
+            } else {
+                $current = if ($lagSeconds -ne $null) { "${lagSeconds}s" } else { "Brak danych" }
+                Write-Host "  Lag: $current ✗ — nadal za wysoki, switchover zablokowany" -ForegroundColor Red
+                $hasCriticalFailure = $true
+            }
         } else {
-            Write-Host "${lagSeconds}s ⚠ (WARNING: >1s)" -ForegroundColor Yellow
-            $checksPassed++ # Warning but not critical
+            Write-Host "  Switchover przerwany." -ForegroundColor Yellow
+            Read-Host "Wcisnij Enter do menu..."
+            return
         }
+    } elseif ($lagSeconds -ne $null) {
+        Write-Host "${lagSeconds}s ✓" -ForegroundColor Green
+        $checksPassed++
     } else {
         Write-Host "No Data ⚠" -ForegroundColor Yellow
         $checksPassed++ # Non-critical if metric not yet published
@@ -4190,28 +4285,79 @@ function Invoke-Switchover-Interactive {
     }
 
     Write-Host ""
-    $confirm = Read-Host "Type 'PROMOTE' to confirm switchover"
-    if ($confirm -eq "PROMOTE") {
-        $timeout = Read-Host "Enter Timeout in seconds (default: 300)"
-        if ([string]::IsNullOrWhiteSpace($timeout)) { $timeout = "300" }
-
-        Write-Log "Executing Switchover..." -ForegroundColor Green
-        try {
-            $swArgs = @("rds", "switchover-blue-green-deployment", "--blue-green-deployment-identifier", $bgId, "--switchover-timeout", $timeout, "--profile", $global:AWSProfile)
-            Invoke-AWS-WithRetry -Arguments $swArgs | Out-Null
-            Write-Log "Switchover initiated! The database is flipping to Green." -ForegroundColor Cyan
-
-            Write-Host ""
-            Write-Host "Switchover is in progress. After completion, you can run the cleanup wizard." -ForegroundColor White
-            $cleanup = Read-Host "Run Post-Switchover Cleanup Wizard now? (y/N)"
-            if ($cleanup -eq 'y') {
-                Start-PostSwitchoverCleanup -BGDeploymentId $bgId -OldSourceId $sourceId
-            }
-        } catch {
-            Write-Log "Switchover Failed: $_" -ForegroundColor Red
+    if (-not $autoSwitchover) {
+        Write-Host ""
+        $confirm = Read-Host "Type 'PROMOTE' to confirm switchover"
+        if ($confirm -ne "PROMOTE") {
+            Write-Host "Operation cancelled." -ForegroundColor Yellow
+            Read-Host "Press Enter to menu..."
+            return
         }
     } else {
-        Write-Host "Operation cancelled." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Auto-switchover — warunek lag spelniomy, pomijam potwierdzenie." -ForegroundColor Green
+    }
+
+    $timeout = Read-Host "Enter Timeout in seconds (default: 300)"
+    if ([string]::IsNullOrWhiteSpace($timeout)) { $timeout = "300" }
+
+    Write-Log "Executing Switchover..." -ForegroundColor Green
+    try {
+        $swArgs = @("rds", "switchover-blue-green-deployment", "--blue-green-deployment-identifier", $bgId, "--switchover-timeout", $timeout, "--profile", $global:AWSProfile)
+        Invoke-AWS-WithRetry -Arguments $swArgs | Out-Null
+        $global:RDSInstancesCache = $null
+        Write-Log "Switchover zainicjowany! Oczekiwanie na zakonczenie..." -ForegroundColor Cyan
+
+        # Poll for completion (max ~10 minutes)
+        Write-Host ""
+        $pollCount = 0
+        $switchoverDone = $false
+        while (-not $switchoverDone -and $pollCount -lt 40) {
+            Start-Sleep -Seconds 15
+            $pollCount++
+            $bgCheck = Get-BlueGreenDeployments | Where-Object { $_.BlueGreenDeploymentIdentifier -eq $bgId }
+            $currentStatus = if ($bgCheck) { $bgCheck.Status } else { "UNKNOWN" }
+            $elapsed = [math]::Round($pollCount * 15 / 60, 1)
+            Write-Host "  [${elapsed}m] Status: $currentStatus" -ForegroundColor Gray
+            if ($currentStatus -eq "SWITCHOVER_COMPLETED") { $switchoverDone = $true }
+        }
+
+        if ($switchoverDone) {
+            Write-Host ""
+            Write-Host "  Switchover zakonczony pomyslnie." -ForegroundColor Green
+            $global:RDSInstancesCache = $null
+
+            # Resolve old Blue identifier after role swap
+            $bgAfter = Get-BlueGreenDeployments | Where-Object { $_.BlueGreenDeploymentIdentifier -eq $bgId }
+            $oldBlueId = if ($bgAfter) { Get-InstanceIdFromArn $bgAfter.Source } else { $sourceId }
+
+            # Ask about stopping old Blue
+            Write-Host ""
+            $stopOld = Read-Host "Zatrzymac stary Blue '$oldBlueId'? (y/N)"
+            if ($stopOld -eq 'y') {
+                try {
+                    $stopArgs = @("rds", "stop-db-instance", "--db-instance-identifier", $oldBlueId, "--profile", $global:AWSProfile)
+                    Invoke-AWS-WithRetry -Arguments $stopArgs | Out-Null
+                    Write-Host "  Stop zainicjowany dla '$oldBlueId'." -ForegroundColor Green
+                    $global:RDSInstancesCache = $null
+                } catch {
+                    Write-Host "  Blad zatrzymania instancji: $_" -ForegroundColor Red
+                }
+            }
+
+            # Offer cleanup wizard
+            Write-Host ""
+            $cleanup = Read-Host "Uruchomic Post-Switchover Cleanup Wizard? (y/N)"
+            if ($cleanup -eq 'y') {
+                Start-PostSwitchoverCleanup -BGDeploymentId $bgId -OldSourceId $oldBlueId
+            }
+        } else {
+            Write-Host ""
+            $elapsed = [math]::Round($pollCount * 15 / 60, 1)
+            Write-Host "  Switchover wciaz trwa po ${elapsed}m. Sprawdz Monitor-BGStatus." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Log "Switchover Failed: $_" -ForegroundColor Red
     }
     Read-Host "Press Enter to menu..."
 }
@@ -4326,7 +4472,10 @@ function Update-OperatingSystem {
                 $t = $_
                 $p = $using:prof
                 try {
-                    aws rds apply-pending-maintenance-action --resource-identifier $t.ResourceArn --apply-action "system-update" --opt-in-type "immediate" --profile $p | Out-Null
+                    $out = aws rds apply-pending-maintenance-action --resource-identifier $t.ResourceArn --apply-action "system-update" --opt-in-type "immediate" --profile $p 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        return [PSCustomObject]@{ Id = $t.InstanceID; Status = "ERROR"; Msg = ($out | Out-String).Trim() }
+                    }
                     return [PSCustomObject]@{ Id = $t.InstanceID; Status = "OK" }
                 } catch {
                     return [PSCustomObject]@{ Id = $t.InstanceID; Status = "ERROR"; Msg = $_.ToString() }
@@ -4337,8 +4486,12 @@ function Update-OperatingSystem {
         } else {
             foreach ($task in $taskList) {
                 try {
-                    aws rds apply-pending-maintenance-action --resource-identifier $task.ResourceArn --apply-action "system-update" --opt-in-type "immediate" --profile $prof | Out-Null
-                    Write-Host "OK: $($task.InstanceID)" -ForegroundColor Green
+                    $out = aws rds apply-pending-maintenance-action --resource-identifier $task.ResourceArn --apply-action "system-update" --opt-in-type "immediate" --profile $prof 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host "Failed ($($task.InstanceID)): $(($out | Out-String).Trim())" -ForegroundColor Red
+                    } else {
+                        Write-Host "OK: $($task.InstanceID)" -ForegroundColor Green
+                    }
                 } catch {
                     Write-Host "Failed ($($task.InstanceID)): $_" -ForegroundColor Red
                 }
@@ -4391,7 +4544,7 @@ function Apply-PendingMaintenance {
                     ResourceArn = $p.ResourceIdentifier
                     InstanceID = $id
                     Action = $d.Action
-                    Status = $d.CurrentApplyDate ? "Scheduled" : "Available" # Simplified status check
+                    Status = if ($d.CurrentApplyDate) { "Scheduled" } else { "Available" }
                     Description = $d.Description
                     AutoApplied = $d.AutoAppliedAfterDate
                 }
@@ -4845,7 +4998,7 @@ function Upgrade-Database-Interactive {
 
             try {
                 $output = Invoke-AWS-WithRetry -Arguments $argsList -ReturnJson
-                $res = $output | ConvertFrom-Json
+                $res = ($output -join "") | ConvertFrom-Json
                 Write-Host "Upgrade initiated successfully!" -ForegroundColor Cyan
                 Write-Host "Status: $($res.DBInstance.DBInstanceStatus)" -ForegroundColor Gray
             } catch {
