@@ -58,8 +58,9 @@ Basic EC2 instance operations: select, start, stop, create/remove snapshots, and
 ### AWS Sessions
 
 - **IAM Identity Center (SSO)** authentication flow
+- **Cross-account role profiles** (`source_profile` chaining) — automatically resolves the root SSO profile for login (e.g. `VESA_BOOMI → veolia`)
 - **Assume Role / Granted** session management
-- Automatic SSO token refresh on expiration
+- Automatic SSO token refresh on expiration — streams the verification URL live and opens the default browser; URL is also visible in the terminal for copy/paste into incognito
 - Color-coded profiles by environment: 🟢 Read-Only | 🟠 Non-Prod RW | 🔴 Prod RW
 
 ---
