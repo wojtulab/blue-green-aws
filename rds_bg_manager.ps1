@@ -1,4 +1,4 @@
-# VERSION: 2026.05.25.01
+# VERSION: 2026.05.26.01
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,12 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-05-26
+    - BUGFIX: Fixed "Missing sso_start_url / sso_region" error for cross-account role profiles (e.g. VESA_BOOMI, VESA_PROD, veri-campus). These profiles use `source_profile` chaining, not a direct `sso_session`. `aws sso login` must target the root SSO profile. Added `Resolve-SSOLoginProfile` which walks the `source_profile` chain to find the correct login target.
+    - BUGFIX: `Get-AWSConfigData` now exposes `SourceProfiles` (child → parent map) in its return value so the chain can be resolved without re-parsing the config file.
+    - UX: Added `Invoke-SSOLogin` helper — runs `aws sso login --no-browser` and streams output line-by-line so the verification URL is visible immediately. Once the URL is detected in the stream, the default browser is opened automatically via `Start-Process`. Previously, buffering the full command output caused a silent hang while waiting for auth that never started.
+    - UX: Both SSO login paths (`Check-SSOSession` and the expired-token retry in `Invoke-AWS-WithRetry`) now use the new `Invoke-SSOLogin` and `Resolve-SSOLoginProfile` helpers.
+
     2026-05-25
     - PERFORMANCE: Optimized 'Create Blue/Green Deployment' pre-load sequence. Split pre-load job into two stages: engine-version lookup (fast path, ~3-5s wait) + parameter-group lookup (background job while user selects version). Reduced wait timeouts from 30s → 8s (engine) / 15s (upgrade versions) / 12s (parameter groups). Eliminates ~25s UI freeze during "Finalising pre-load..." for typical AWS call delays.
 
@@ -503,9 +509,12 @@ function Invoke-AWS-WithRetry {
                  if ($retryCount -lt $maxRetries) {
                      $resp = Read-Host "Do you want to run 'aws sso login' and retry? (Y/n)"
                      if ($resp -ne 'n') {
-                         Write-Log "Running aws sso login..." -ForegroundColor Cyan
+                         $loginProfile = Resolve-SSOLoginProfile -ProfileName $global:AWSProfile
+                         if ($loginProfile -ne $global:AWSProfile) {
+                             Write-Log "Logging in via root SSO profile '$loginProfile'..." -ForegroundColor Gray
+                         }
                          try {
-                             aws sso login --profile $global:AWSProfile
+                             Invoke-SSOLogin -Profile $loginProfile
                              Write-Log "Login completed. Retrying command..." -ForegroundColor Green
                              $retryCount++
                              continue
@@ -995,6 +1004,37 @@ function Select-RDSInstance-Live {
     }
 }
 
+function Resolve-SSOLoginProfile {
+    param([string]$ProfileName)
+    # Cross-account role profiles use source_profile; aws sso login must target
+    # the root SSO profile (the one with sso_session), not the derived role profile.
+    $configData = if ($global:AWSConfigDataCache) { $global:AWSConfigDataCache } else { Get-AWSConfigData }
+    $visited = @{}
+    $current = $ProfileName
+    while ($configData.SourceProfiles.ContainsKey($current)) {
+        if ($visited[$current]) { break } # guard against cycles
+        $visited[$current] = $true
+        $current = $configData.SourceProfiles[$current]
+    }
+    return $current
+}
+
+function Invoke-SSOLogin {
+    param([string]$Profile)
+    # Stream output line-by-line so the URL appears before auth completes.
+    # --no-browser suppresses auto-open; we open the browser ourselves once we have the URL.
+    $urlOpened = $false
+    & aws sso login --profile $Profile --no-browser 2>&1 | ForEach-Object {
+        Write-Host $_
+        if (-not $urlOpened -and "$_" -match "(https://\S+)") {
+            $url = $matches[1].TrimEnd('.')
+            Write-Log "Opening browser: $url" -ForegroundColor Cyan
+            Start-Process $url
+            $urlOpened = $true
+        }
+    }
+}
+
 function Check-SSOSession {
     <#
     .DESCRIPTION
@@ -1009,9 +1049,14 @@ function Check-SSOSession {
         }
     } catch {
         Write-Log "Session expired or invalid." -ForegroundColor Yellow
+        # Resolve the root SSO profile (cross-account profiles use source_profile chains)
+        $loginProfile = Resolve-SSOLoginProfile -ProfileName $global:AWSProfile
+        if ($loginProfile -ne $global:AWSProfile) {
+            Write-Log "Profile '$global:AWSProfile' chains to SSO profile '$loginProfile' — logging in via '$loginProfile'." -ForegroundColor Gray
+        }
         $resp = Read-Host "Do you want to run 'aws sso login' now? (Y/n)"
         if ($resp -ne 'n') {
-            aws sso login --profile $global:AWSProfile
+            Invoke-SSOLogin -Profile $loginProfile
         }
     }
 }
@@ -1106,9 +1151,10 @@ function Remove-AWSProfile-Interactive {
 function Get-AWSConfigData {
     # Parse .aws/config to get sessions and roles
     $data = @{
-        Sessions = @{} # SessionName -> List of Profiles
-        Roles = @{}    # ProfileName -> RoleName
-        Metadata = @{} # ProfileName -> { Env, Type }
+        Sessions = @{}       # SessionName -> List of Profiles
+        Roles = @{}          # ProfileName -> RoleName
+        Metadata = @{}       # ProfileName -> { Env, Type }
+        SourceProfiles = @{} # ChildProfile -> ParentProfile (for cross-account role chains)
     }
 
     $awsPath = Get-AWSDirectoryPath
@@ -1150,6 +1196,7 @@ function Get-AWSConfigData {
                 } elseif ($line -match "^source_profile\s*=\s*(?<val>.+)") {
                     $source = $matches['val'].Trim()
                     $sourceProfiles[$currentProfile] = $source
+                    $data.SourceProfiles[$currentProfile] = $source
                 } elseif ($line -match "^sso_role_name\s*=\s*(?<val>.+)") {
                     $data.Roles[$currentProfile] = $matches['val'].Trim()
                 } elseif ($line -match "^env\s*=\s*(?<val>.+)") {
@@ -3525,6 +3572,28 @@ function New-BGDeployment-Interactive {
 
         if ($err.ScriptStackTrace) {
              Write-Log "Script Stack Trace:`n$($err.ScriptStackTrace)"
+        }
+
+        # Offer parameter group comparison when error suggests a PG mismatch
+        $isPGMismatch = $msg -match 'lower_case_table_names|SourceDatabaseNotSupported|parameter.{0,20}group|ParameterGroupFamily'
+        if ($isPGMismatch -and $sourceObj -and $sourceObj.DBParameterGroups) {
+            $sourcePGForCmp = $sourceObj.DBParameterGroups[0].DBParameterGroupName
+            $targetPGForCmp = if (![string]::IsNullOrWhiteSpace($pgName)) {
+                $pgName
+            } elseif (![string]::IsNullOrWhiteSpace($targetFamily)) {
+                "default.$targetFamily"
+            } else { $null }
+
+            if ($sourcePGForCmp -and $targetPGForCmp) {
+                Write-Host ""
+                Write-Host "This error is often caused by a parameter mismatch (e.g. lower_case_table_names)." -ForegroundColor Yellow
+                Write-Host "  Source PG : $sourcePGForCmp" -ForegroundColor Cyan
+                Write-Host "  Target PG : $targetPGForCmp" -ForegroundColor Cyan
+                $cmpChoice = Read-Host "Compare parameter groups to find differences? (y/N)"
+                if ($cmpChoice -eq 'y') {
+                    Compare-ParameterGroups -SourcePG $sourcePGForCmp -TargetPG $targetPGForCmp
+                }
+            }
         }
     }
     Read-Host "Press Enter to menu..."
