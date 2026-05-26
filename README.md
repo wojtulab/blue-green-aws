@@ -75,38 +75,131 @@ Basic EC2 instance operations: select, start, stop, create/remove snapshots, and
 
 ---
 
-## Installation
+## Installation (Windows)
+
+### 1. Install PowerShell 7
+
+PowerShell 7 (`pwsh`) is recommended — it enables parallel snapshot/OS update execution and has better rendering support.
+
+**Option A — winget (Windows 10/11):**
 
 ```powershell
-# Clone the repository
-git clone https://github.com/wojtulab/blue-green-aws.git
-cd blue-green-aws
-
-# Run the tool
-pwsh ./rds_bg_manager.ps1
-# or on Windows PowerShell:
-powershell -ExecutionPolicy Bypass -File rds_bg_manager.ps1
+winget install --id Microsoft.PowerShell --source winget
 ```
+
+**Option B — direct download:**
+
+Download the `.msi` installer from the [PowerShell GitHub releases page](https://github.com/PowerShell/PowerShell/releases/latest) and run it.
+
+After installation, open **PowerShell 7** from the Start menu (it appears as `pwsh` or `PowerShell 7`), not the old Windows PowerShell 5.1.
+
+---
+
+### 2. Install AWS CLI v2
+
+Download and run the installer from the [AWS CLI v2 page](https://aws.amazon.com/cli/). Verify:
+
+```powershell
+aws --version
+# aws-cli/2.x.x ...
+```
+
+---
+
+### 3. Download the script
+
+Copy `rds_bg_manager.ps1` (and optionally `rds_bg_manager.config.ps1`) to a local folder, e.g. `C:\Tools\rds-manager\`.
+
+---
+
+### 4. Unblock the files
+
+Windows marks files downloaded from the internet as blocked. Scripts won't run until unblocked.
+
+**In PowerShell 7 (run as yourself, no admin needed):**
+
+```powershell
+Unblock-File -Path "C:\Tools\rds-manager\rds_bg_manager.ps1"
+Unblock-File -Path "C:\Tools\rds-manager\rds_bg_manager.config.ps1"
+```
+
+Or unblock both at once:
+
+```powershell
+Get-ChildItem "C:\Tools\rds-manager\*.ps1" | Unblock-File
+```
+
+You can also unblock via Explorer: right-click the file → **Properties** → tick **Unblock** → OK.
+
+---
+
+### 5. Set execution policy
+
+PowerShell blocks unsigned scripts by default. Set the policy for your user (no admin required):
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+`RemoteSigned` allows local scripts and unblocked downloaded scripts to run freely.
+
+---
+
+### 6. Run the script
+
+```powershell
+# Open PowerShell 7 (pwsh) and navigate to the script folder:
+cd C:\Tools\rds-manager
+
+# Run:
+pwsh .\rds_bg_manager.ps1
+```
+
+If you still get a policy error, you can bypass it for a single run:
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File .\rds_bg_manager.ps1
+```
+
+> **Do not use Windows PowerShell 5.1 (`powershell.exe`)** for this tool if you can avoid it — some rendering and parallel features require PS 7.
+
+---
 
 ### AWS CLI Setup
 
 The tool requires AWS CLI v2 with at least one SSO profile configured:
 
-```bash
+```powershell
 aws configure sso
 ```
 
-Profiles should be defined in `~/.aws/config` with optional `env` and `type` fields for color-coding:
+Profiles should be defined in `%USERPROFILE%\.aws\config` with optional `env` and `type` fields for color-coding:
 
 ```ini
+[sso-session my-company]
+sso_start_url = https://my-company.awsapps.com/start/
+sso_region = eu-west-1
+sso_registration_scopes = sso:account:access
+
 [profile my-prod-admin]
 sso_session = my-company
 sso_account_id = 123456789012
 sso_role_name = AdministratorAccess
 region = eu-west-1
 # Optional metadata for UI color-coding:
-# env = PRD
-# type = RW
+env = prod
+type = rw
+```
+
+Cross-account role profiles (assume-role via `source_profile`) are also supported — the tool automatically resolves the login chain:
+
+```ini
+[profile my-cross-account]
+source_profile = my-prod-admin
+role_arn = arn:aws:iam::999999999999:role/MyRole
+region = eu-west-1
+env = prod
+type = rw
 ```
 
 ---
