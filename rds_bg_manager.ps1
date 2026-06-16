@@ -309,8 +309,12 @@ function Confirm-SnapshotQuota {
         }
         Write-Host "WARNING: AWS Snapshot Quota Reached!" -ForegroundColor Red
         Write-Host "You have $current/$max manual snapshots. Need $RequiredSlots more slot(s)." -ForegroundColor Yellow
-        $resp = Read-Host "Delete old snapshots, then press ENTER to re-check, or type 'Q' to quit"
+        $resp = Read-Host "Delete old snapshots + ENTER to re-check, 'F' to force anyway, or 'Q' to quit"
         if ($resp -eq 'Q' -or $resp -eq 'q') { return $false }
+        if ($resp -eq 'F' -or $resp -eq 'f') {
+            Write-Log "Quota override: proceeding despite limit ($current/$max)." -ForegroundColor DarkYellow
+            return $true
+        }
     }
 }
 
@@ -2032,6 +2036,105 @@ function Monitor-RDS-State {
     try { [Console]::CursorVisible = $true } catch {}
 }
 
+function Set-RDSMonitoringTag-Interactive {
+    $instances = Get-CachedRDSInstances
+    if (-not $instances -or $instances.Count -eq 0) {
+        Write-Host "No RDS instances found." -ForegroundColor Yellow
+        Read-Host "Press Enter to menu..."; return
+    }
+
+    $colHeader = Get-AnsiString ("  {0,-45} {1,-10} {2}" -f "Instance", "Monitoring", "Status") -Color White
+
+    $headerBlock = {
+        param($SearchString, $TotalItems, $FilteredCount)
+        $lines = @(Get-Header-Lines)
+        $lines += Get-AnsiString "SSG-MONITORING Tag Management" -Color Yellow
+        $lines += "------------------------------------------"
+        $lines += Get-AnsiString "Filter: $SearchString" -Color Cyan
+        $lines += "------------------------------------------"
+        $lines += $colHeader
+        $lines += "------------------------------------------"
+        return $lines
+    }.GetNewClosure()
+
+    $footerBlock = {
+        param($MultiSelect)
+        return @(Get-AnsiString "UP/DOWN: Navigate  |  SPACE: Toggle  |  ENTER: Confirm  |  F5: Refresh  |  Type: Filter  |  ESC: Back" -Color DarkGray)
+    }
+
+    $selectedIndices = $null
+    while ($true) {
+        $options = @($instances | ForEach-Object {
+            $tagVal   = ($_.TagList | Where-Object { $_.Key -eq "SSG-MONITORING" } | Select-Object -First 1).Value
+            $tagColor = if ($tagVal -eq "ENABLE") { "Green" } elseif ($tagVal -eq "DISABLE") { "Red" } else { "DarkGray" }
+            $tagLabel = if ($tagVal) { $tagVal } else { "---" }
+            $tagStr   = Get-AnsiString ("{0,-10}" -f $tagLabel) -Color $tagColor
+            $status   = Get-AnsiString $_.DBInstanceStatus -Color $(if ($_.DBInstanceStatus -eq "available") { "Green" } elseif ($_.DBInstanceStatus -match "stop") { "DarkYellow" } else { "Yellow" })
+            "  {0,-45} {1} {2}" -f $_.DBInstanceIdentifier, $tagStr, $status
+        })
+
+        $selectedIndices = Invoke-InteractiveViewportSelection `
+            -Items $options `
+            -HeaderContent $headerBlock `
+            -FooterContent $footerBlock `
+            -MultiSelect `
+            -ReturnIndex
+
+        if ($selectedIndices -eq -98) {
+            # F5 — refresh instance data
+            $instances = Get-CachedRDSInstances -Force
+            continue
+        }
+        break
+    }
+
+    if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
+    if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
+    if (-not $selectedIndices -or $selectedIndices.Count -eq 0) {
+        Write-Host "No instances selected." -ForegroundColor Yellow
+        Read-Host "Press Enter to menu..."; return
+    }
+
+    $selected = @($selectedIndices | ForEach-Object { $instances[$_] })
+    Write-Host ""
+    Write-Host "Selected instances:" -ForegroundColor Cyan
+    $selected | ForEach-Object { Write-Host "  - $($_.DBInstanceIdentifier)" -ForegroundColor White }
+    Write-Host ""
+
+    $action = Show-Menu -Title "Set SSG-MONITORING tag to:" -Options @("ENABLE monitoring", "DISABLE monitoring")
+    if ($action -eq -99) { $global:RestartSessionSelection = $true; return }
+    if ($action -is [int] -and $action -lt 0) { return }
+    $tagValue = if ($action -eq 0) { "ENABLE" } else { "DISABLE" }
+    $tagColor = if ($tagValue -eq "ENABLE") { "Green" } else { "DarkYellow" }
+
+    Write-Host ""
+    Write-Host "Setting SSG-MONITORING=$tagValue on $($selected.Count) instance(s)..." -ForegroundColor $tagColor
+
+    $ok = 0; $fail = 0
+    foreach ($inst in $selected) {
+        $id   = $inst.DBInstanceIdentifier
+        $arn  = $inst.DBInstanceArn
+        try {
+            Invoke-AWS-WithRetry -Arguments @(
+                "rds", "add-tags-to-resource",
+                "--resource-name", $arn,
+                "--tags", "Key=SSG-MONITORING,Value=$tagValue",
+                "--profile", $global:AWSProfile
+            ) | Out-Null
+            Write-Host "  OK  $id" -ForegroundColor $tagColor
+            $ok++
+        } catch {
+            Write-Host "  FAIL $id : $_" -ForegroundColor Red
+            $fail++
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Done: $ok OK, $fail failed." -ForegroundColor $(if ($fail -gt 0) { "Yellow" } else { "Green" })
+    $global:RDSInstancesCache = $null  # invalidate so tag values refresh on next load
+    Read-Host "Press Enter to menu..."
+}
+
 function Show-RDS-Menu {
     Start-InstanceCacheWarmJob
     while ($true) {
@@ -2061,6 +2164,8 @@ function Show-RDS-Menu {
             "Execute Switchover",
             "Apply Pending Maintenance",
             "------------------------------------------",
+            "Tag Management (SSG-MONITORING)",
+            "------------------------------------------",
             "Back to Main Menu"
         )
 
@@ -2069,13 +2174,13 @@ function Show-RDS-Menu {
         if ($global:RestartSessionSelection) { return }
 
         switch ($selection) {
-            0 { Select-ActiveInstance }
-            2 { Show-InstanceReports-Menu }
-            3 { Show-OtherReports-Menu }
-            5 { Start-RDS-Interactive }
-            6 { Stop-RDS-Interactive }
-            7 { Remove-RDS-Interactive }
-            8 { Monitor-RDS-State }
+            0  { Select-ActiveInstance }
+            2  { Show-InstanceReports-Menu }
+            3  { Show-OtherReports-Menu }
+            5  { Start-RDS-Interactive }
+            6  { Stop-RDS-Interactive }
+            7  { Remove-RDS-Interactive }
+            8  { Monitor-RDS-State }
             10 { New-RDSSnapshot-Interactive }
             11 { New-MultipleRDSSnapshots-Interactive }
             12 { Remove-RDSSnapshot-Interactive }
@@ -2087,7 +2192,8 @@ function Show-RDS-Menu {
             19 { Update-OperatingSystem }
             20 { Invoke-Switchover-Interactive }
             21 { Apply-PendingMaintenance }
-            23 { return }
+            23 { Set-RDSMonitoringTag-Interactive }
+            25 { return }
         }
     }
 }
@@ -2178,20 +2284,32 @@ function Get-BlueGreenDeployments {
 function Get-ManualSnapshotCount {
     <#
     .DESCRIPTION
-    Returns the count of manual DB snapshots (Quota Check).
+    Returns the count of manual DB snapshots (instance + cluster) for quota check.
+    Also refreshes $script:MaxManualSnapshots from AWS Service Quotas if possible.
     #>
     Write-Log "Checking manual snapshot quota..." -ForegroundColor Cyan
     try {
-        # Using --query "length(DBSnapshots)" to get count directly from server side
-        $argsList = @("rds", "describe-db-snapshots", "--snapshot-type", "manual", "--query", "length(DBSnapshots)", "--output", "text", "--profile", $global:AWSProfile)
+        # Instance snapshots
+        $instArgs = @("rds", "describe-db-snapshots", "--snapshot-type", "manual", "--query", "length(DBSnapshots)", "--output", "text", "--profile", $global:AWSProfile)
+        $instOut  = Invoke-AWS-WithRetry -Arguments $instArgs
+        $instCount = ($instOut | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } | Measure-Object -Sum).Sum
 
-        # We don't use -ReturnJson because we want raw text
-        $output = Invoke-AWS-WithRetry -Arguments $argsList
+        # Cluster snapshots (Aurora) — separate API, same quota bucket in console
+        $clusterArgs = @("rds", "describe-db-cluster-snapshots", "--snapshot-type", "manual", "--query", "length(DBClusterSnapshots)", "--output", "text", "--profile", $global:AWSProfile)
+        $clusterOut  = Invoke-AWS-WithRetry -Arguments $clusterArgs
+        $clusterCount = ($clusterOut | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } | Measure-Object -Sum).Sum
 
-        $countStr = $output | Out-String
-        if ([string]::IsNullOrWhiteSpace($countStr)) { return 0 }
+        $total = [int]($instCount ?? 0) + [int]($clusterCount ?? 0)
 
-        return [int]($countStr.Trim())
+        # Refresh quota limit from Service Quotas (quota code L-272F1212 = Manual DB Snapshots)
+        try {
+            $quotaArgs = @("service-quotas", "get-service-quota", "--service-code", "rds", "--quota-code", "L-272F1212", "--query", "Quota.Value", "--output", "text", "--profile", $global:AWSProfile)
+            $quotaOut  = Invoke-AWS-WithRetry -Arguments $quotaArgs
+            $quotaVal  = ($quotaOut | Where-Object { $_ -match '^\d+(\.\d+)?$' } | Select-Object -First 1)
+            if ($quotaVal) { $script:MaxManualSnapshots = [int][double]$quotaVal }
+        } catch {}
+
+        return $total
     } catch {
         Write-Log "Error checking snapshot count: $_" -ForegroundColor Red
         return 999 # Fail safe (assume full)
@@ -5261,9 +5379,14 @@ function Upgrade-Database-Interactive {
         Show-Header
         Write-Host "UPGRADE CONFIRMATION" -ForegroundColor Magenta
         Write-Host "------------------------------------------"
+        $monTagVal = ($instance.TagList | Where-Object { $_.Key -eq "SSG-MONITORING" } | Select-Object -First 1).Value
+        if (-not $monTagVal) { $monTagVal = "(no tag)" }
+        $monColor = if ($monTagVal -eq "ENABLE") { "Red" } elseif ($monTagVal -eq "DISABLE") { "Green" } else { "Gray" }
+
         Write-Host "Instance:       $($instance.DBInstanceIdentifier)" -ForegroundColor White
         Write-Host "Target Version: $targetVer" -ForegroundColor Yellow
         Write-Host "Is Major:       $($selectedTarget.IsMajorVersionUpgrade)" -ForegroundColor Gray
+        Write-Host "SSG-MONITORING: $monTagVal" -ForegroundColor $monColor
         Write-Host "------------------------------------------"
         Write-Host "REMINDER: Disable monitoring before proceeding!" -ForegroundColor Red -BackgroundColor Yellow
         Write-Host "------------------------------------------"
