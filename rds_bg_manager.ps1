@@ -1,4 +1,4 @@
-# VERSION: 2026.06.16.01
+# VERSION: 2026.06.16.02
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -229,6 +229,10 @@ $global:AWSProfile = $null
 $global:SelectedInstance = $null
 $global:LogFile = $Global:Config.LogFileFormat -f (Get-Date)
 $global:UpdateUrl = $Global:Config.UpdateUrl
+if ($global:UpdateUrl -and $global:UpdateUrl -notmatch '^https://') {
+    Write-Host "Config Warning: UpdateUrl must be an https:// URL. OTA updates disabled." -ForegroundColor Yellow
+    $global:UpdateUrl = $null
+}
 
 # --- HELPER FUNCTIONS ---
 
@@ -239,12 +243,14 @@ $global:UpdateUrl = $Global:Config.UpdateUrl
 $global:RDSInstancesCache = $null
 $global:RDSInstancesCacheTime = $null
 $global:AWSConfigDataCache = $null
+$script:BGDeploymentsCache = $null
+$script:BGDeploymentsCacheTime = $null
 
 function Get-AWSDirectoryPath {
-    $path = Join-Path $env:USERPROFILE ".aws"
-    if (-not (Test-Path $path) -and $env:HOME) {
-        $candidate = Join-Path $env:HOME ".aws"
-        if (Test-Path $candidate) { $path = $candidate }
+    if ($IsWindows -or (-not $IsWindows -and -not $env:HOME)) {
+        $path = Join-Path ([System.Environment]::GetFolderPath('UserProfile')) ".aws"
+    } else {
+        $path = Join-Path $env:HOME ".aws"
     }
     return $path
 }
@@ -339,7 +345,9 @@ function Get-CachedRDSInstances {
                         $global:RDSInstancesCacheTime = Get-Date
                     }
                 }
-            } catch {}
+            } catch {
+                Write-Log "Cache warm job returned invalid JSON: $_" -ForegroundColor Yellow
+            }
             Remove-Job $global:RDSCacheWarmJob -Force -ErrorAction SilentlyContinue
             $global:RDSCacheWarmJob = $null
         } elseif ($jobState -in 'Failed', 'Stopped') {
@@ -477,7 +485,7 @@ function Invoke-AWS-WithRetry {
     $output = $null
     $baseBackoff = 2 # seconds for exponential backoff
 
-    while (-not $commandSuccess -and $retryCount -le $maxRetries) {
+    while (-not $commandSuccess -and $retryCount -lt $maxRetries) {
         try {
             # Execute AWS CLI
             # We use & operator. Arguments array is passed.
@@ -1035,7 +1043,11 @@ function Invoke-SSOLogin {
         if (-not $urlOpened -and "$_" -match "(https://\S+)") {
             $url = $matches[1].TrimEnd('.')
             Write-Log "Opening browser: $url" -ForegroundColor Cyan
-            Start-Process $url
+            if ($url -match '^https://[a-zA-Z0-9\-]+\.awsapps\.com/') {
+                Start-Process $url
+            } else {
+                Write-Log "Unexpected SSO URL — not opening browser: $url" -ForegroundColor Red
+            }
             $urlOpened = $true
         }
     }
@@ -1049,10 +1061,7 @@ function Check-SSOSession {
     Write-Log "Checking AWS SSO session for '$global:AWSProfile'..." -ForegroundColor Gray
     try {
         # sts get-caller-identity verifies if we have valid credentials
-        aws sts get-caller-identity --profile $global:AWSProfile > $null 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "STS check failed (exit code: $LASTEXITCODE)"
-        }
+        Invoke-AWS-WithRetry -Arguments @("sts", "get-caller-identity", "--profile", $global:AWSProfile) | Out-Null
     } catch {
         Write-Log "Session expired or invalid." -ForegroundColor Yellow
         # Resolve the root SSO profile (cross-account profiles use source_profile chains)
@@ -1169,7 +1178,6 @@ function Get-AWSConfigData {
     if (Test-Path $configFile) {
         $content = Get-Content $configFile
         $currentProfile = $null
-        $sourceProfiles = @{} # ChildProfile -> ParentProfile
 
         foreach ($line in $content) {
             $line = $line.Trim()
@@ -1201,7 +1209,6 @@ function Get-AWSConfigData {
                     }
                 } elseif ($line -match "^source_profile\s*=\s*(?<val>.+)") {
                     $source = $matches['val'].Trim()
-                    $sourceProfiles[$currentProfile] = $source
                     $data.SourceProfiles[$currentProfile] = $source
                 } elseif ($line -match "^sso_role_name\s*=\s*(?<val>.+)") {
                     $data.Roles[$currentProfile] = $matches['val'].Trim()
@@ -1216,8 +1223,8 @@ function Get-AWSConfigData {
         }
 
         # Second Pass: Resolve Source Profiles
-        foreach ($child in $sourceProfiles.Keys) {
-            $parent = $sourceProfiles[$child]
+        foreach ($child in $data.SourceProfiles.Keys) {
+            $parent = $data.SourceProfiles[$child]
             # Find which session the parent belongs to
             foreach ($session in $data.Sessions.Keys) {
                 if ($data.Sessions[$session] -contains $parent) {
@@ -1266,6 +1273,7 @@ function Select-Client-Session {
 
     if ($idx -eq ($options.Count - 1)) { return $null } # Show All
     if ($idx -lt 0) { exit } # Cancel (ESC at root = exit)
+    if ($idx -ge $sessions.Count) { continue }
 
     $selectedSession = $sessions[$idx]
     return @{
@@ -1750,6 +1758,55 @@ function Remove-EC2Snapshot-Interactive {
     Read-Host "Press Enter to menu..."
 }
 
+function Get-RDSCloudWatchMetrics {
+    param([string]$InstanceId)
+    $result = @{ CPU = $null; Connections = $null }
+    if ([string]::IsNullOrWhiteSpace($InstanceId)) { return $result }
+    try {
+        $end   = (Get-Date).ToUniversalTime()
+        $start = $end.AddMinutes(-10)
+        $startStr = $start.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $endStr   = $end.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+        $cpuArgs = @(
+            "cloudwatch", "get-metric-statistics",
+            "--namespace", "AWS/RDS",
+            "--metric-name", "CPUUtilization",
+            "--dimensions", "Name=DBInstanceIdentifier,Value=$InstanceId",
+            "--start-time", $startStr, "--end-time", $endStr,
+            "--period", "300", "--statistics", "Average",
+            "--output", "json", "--profile", $global:AWSProfile
+        )
+        $json = (Invoke-AWS-WithRetry -Arguments $cpuArgs -ReturnJson) -join ""
+        if (![string]::IsNullOrWhiteSpace($json)) {
+            $data = $json | ConvertFrom-Json
+            if ($data.Datapoints -and $data.Datapoints.Count -gt 0) {
+                $val = ($data.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1).Average
+                $result.CPU = [math]::Round($val, 0)
+            }
+        }
+
+        $connArgs = @(
+            "cloudwatch", "get-metric-statistics",
+            "--namespace", "AWS/RDS",
+            "--metric-name", "DatabaseConnections",
+            "--dimensions", "Name=DBInstanceIdentifier,Value=$InstanceId",
+            "--start-time", $startStr, "--end-time", $endStr,
+            "--period", "300", "--statistics", "Average",
+            "--output", "json", "--profile", $global:AWSProfile
+        )
+        $json2 = (Invoke-AWS-WithRetry -Arguments $connArgs -ReturnJson) -join ""
+        if (![string]::IsNullOrWhiteSpace($json2)) {
+            $data2 = $json2 | ConvertFrom-Json
+            if ($data2.Datapoints -and $data2.Datapoints.Count -gt 0) {
+                $val2 = ($data2.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1).Average
+                $result.Connections = [math]::Round($val2, 0)
+            }
+        }
+    } catch {}
+    return $result
+}
+
 function Monitor-RDS-State {
     $filter = ""
     $currentPage = 0
@@ -1757,8 +1814,18 @@ function Monitor-RDS-State {
 
     try { [Console]::CursorVisible = $false } catch {}
 
+    $cwMetrics = @{}
+
     while ($true) {
         $instances = Get-CachedRDSInstances
+
+        # Fetch CloudWatch metrics once per outer refresh cycle
+        $cwMetrics = @{}
+        if ($instances) {
+            foreach ($inst in $instances) {
+                $cwMetrics[$inst.DBInstanceIdentifier] = Get-RDSCloudWatchMetrics -InstanceId $inst.DBInstanceIdentifier
+            }
+        }
 
         # Apply filter
         $filtered = $instances
@@ -1801,8 +1868,14 @@ function Monitor-RDS-State {
         [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  ────────────────────────────────────────────────────────────────────────────────────────────" -Color DarkGray) $winWidth))
 
         # Column header
-        $colFmt = "  {0,-35} {1,-15} {2,-15} {3}"
-        [void]$sb.AppendLine((Pad-Line (Get-AnsiString ($colFmt -f "Identifier", "Engine", "Status", "Endpoint") -Color White) $winWidth))
+        $showCWCols = ($winWidth -ge 160)
+        if ($showCWCols) {
+            $colFmt = "  {0,-35} {1,-15} {2,-15} {3,-45} {4,-6} {5,-6}"
+            [void]$sb.AppendLine((Pad-Line (Get-AnsiString ($colFmt -f "Identifier", "Engine", "Status", "Endpoint", "CPU%", "Conns") -Color White) $winWidth))
+        } else {
+            $colFmt = "  {0,-35} {1,-15} {2,-15} {3}"
+            [void]$sb.AppendLine((Pad-Line (Get-AnsiString ($colFmt -f "Identifier", "Engine", "Status", "Endpoint") -Color White) $winWidth))
+        }
         [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  ────────────────────────────────────────────────────────────────────────────────────────────" -Color DarkGray) $winWidth))
 
         # Instance rows
@@ -1817,7 +1890,15 @@ function Monitor-RDS-State {
                 elseif ($status -in @("creating", "starting", "modifying", "rebooting")) { $color = "Yellow" }
 
                 $endpoint = if ($inst.Endpoint) { $inst.Endpoint.Address } else { "-" }
-                $rowText = $colFmt -f $inst.DBInstanceIdentifier, $inst.Engine, $status, $endpoint
+
+                if ($showCWCols) {
+                    $cw = $cwMetrics[$inst.DBInstanceIdentifier]
+                    $cpuVal  = if ($cw -and $null -ne $cw.CPU)        { "$($cw.CPU)%" }        else { "-" }
+                    $connVal = if ($cw -and $null -ne $cw.Connections) { "$($cw.Connections)" } else { "-" }
+                    $rowText = $colFmt -f $inst.DBInstanceIdentifier, $inst.Engine, $status, $endpoint, $cpuVal, $connVal
+                } else {
+                    $rowText = $colFmt -f $inst.DBInstanceIdentifier, $inst.Engine, $status, $endpoint
+                }
                 [void]$sb.AppendLine((Pad-Line (Get-AnsiString $rowText -Color $color) $winWidth))
                 $rowsRendered++
             }
@@ -2061,19 +2142,32 @@ function Get-RDSInstances {
 function Get-BlueGreenDeployments {
     <#
     .DESCRIPTION
-    Returns an array of Blue/Green deployment objects.
+    Returns an array of Blue/Green deployment objects. Results are cached for CacheTTLSeconds.
+    Use -Force to bypass cache.
     #>
+    param([switch]$Force)
+    $now = Get-Date
+    if (-not $Force -and $script:BGDeploymentsCache -and $script:BGDeploymentsCacheTime -and
+        ($now - $script:BGDeploymentsCacheTime).TotalSeconds -lt $script:CacheTTLSeconds) {
+        return $script:BGDeploymentsCache
+    }
     Write-Log "Fetching Blue/Green Deployments..." -ForegroundColor Green
     try {
         $argsList = @("rds", "describe-blue-green-deployments", "--output", "json", "--profile", $global:AWSProfile)
         $output = Invoke-AWS-WithRetry -Arguments $argsList -ReturnJson
         $json = $output -join ""
 
-        if ([string]::IsNullOrWhiteSpace($json)) { return @() }
+        if ([string]::IsNullOrWhiteSpace($json)) {
+            $script:BGDeploymentsCache = @()
+            $script:BGDeploymentsCacheTime = $now
+            return @()
+        }
 
         $data = $json | ConvertFrom-Json
-        if (!$data.BlueGreenDeployments) { return @() }
-        return $data.BlueGreenDeployments
+        $result = if ($data.BlueGreenDeployments) { $data.BlueGreenDeployments } else { @() }
+        $script:BGDeploymentsCache = $result
+        $script:BGDeploymentsCacheTime = $now
+        return $result
     } catch {
         Write-Log "Error fetching BG deployments: $_" -ForegroundColor Red
         Start-Sleep -Seconds 2
@@ -2751,6 +2845,137 @@ function Show-CloudWatchAlarms {
     Read-Host "Press Enter to menu..."
 }
 
+function Show-SnapshotRetentionAudit {
+    Show-Header
+    Write-Host "Fetching manual snapshots..." -ForegroundColor Cyan
+
+    try {
+        $snapArgs = @(
+            "rds", "describe-db-snapshots",
+            "--snapshot-type", "manual",
+            "--output", "json",
+            "--query", "DBSnapshots[*].{DBSnapshotIdentifier:DBSnapshotIdentifier,DBInstanceIdentifier:DBInstanceIdentifier,SnapshotCreateTime:SnapshotCreateTime,AllocatedStorage:AllocatedStorage,Status:Status}",
+            "--profile", $global:AWSProfile
+        )
+        $json = (Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson) -join ""
+        if ([string]::IsNullOrWhiteSpace($json)) {
+            Write-Host "No snapshot data returned." -ForegroundColor Yellow
+            Read-Host "Press Enter to menu..."; return
+        }
+        $snaps = $json | ConvertFrom-Json
+        if (-not $snaps -or $snaps.Count -eq 0) {
+            Write-Host "No manual snapshots found." -ForegroundColor Yellow
+            Read-Host "Press Enter to menu..."; return
+        }
+
+        $count = $snaps.Count
+        $quota = $script:MaxManualSnapshots
+        $quotaColor = if ($count / $quota -gt 0.85) { "Red" } elseif ($count / $quota -gt 0.70) { "Yellow" } else { "Green" }
+        Write-Host ""
+        Write-Host ("  Manual Snapshots: {0} / {1}" -f $count, $quota) -ForegroundColor $quotaColor
+
+        $now = Get-Date
+        $b7  = 0; $b30 = 0; $b90 = 0; $b91 = 0
+        $exportData = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        foreach ($s in $snaps) {
+            $age = [math]::Round(($now - [datetime]$s.SnapshotCreateTime).TotalDays, 0)
+            if ($age -lt 7)  { $b7++  }
+            elseif ($age -lt 30) { $b30++ }
+            elseif ($age -le 90) { $b90++ }
+            else { $b91++ }
+            $exportData.Add([PSCustomObject]@{
+                Snapshot = $s.DBSnapshotIdentifier
+                Instance = $s.DBInstanceIdentifier
+                AgeDays  = $age
+                SizeGB   = $s.AllocatedStorage
+                Status   = $s.Status
+            })
+        }
+        Write-Host ("  Age <7d: {0}  |  7-30d: {1}  |  30-90d: {2}  |  >90d: {3}" -f $b7, $b30, $b90, $b91) -ForegroundColor Cyan
+
+        Write-Host ""
+        Write-Host ("  {0,-55} {1,-25} {2,-8} {3,-8} {4}" -f "Snapshot", "Instance", "AgeDays", "SizeGB", "Status") -ForegroundColor White
+        Write-Host "  $('-' * 115)" -ForegroundColor DarkGray
+
+        foreach ($row in ($exportData | Sort-Object AgeDays -Descending)) {
+            $rc = if ($row.AgeDays -gt 90) { "Red" } elseif ($row.AgeDays -gt 30) { "Yellow" } else { "Green" }
+            $name = if ($row.Snapshot.Length -gt 53) { $row.Snapshot.Substring(0,53) + ".." } else { $row.Snapshot }
+            Write-Host ("  {0,-55} {1,-25} {2,-8} {3,-8} {4}" -f $name, $row.Instance, $row.AgeDays, $row.SizeGB, $row.Status) -ForegroundColor $rc
+        }
+        Write-Host ""
+        Export-Report -Data $exportData -DefaultFileName "SnapshotRetentionAudit-$(Get-TimeStamp)"
+    } catch {
+        Write-Host "Error: $_" -ForegroundColor Red
+    }
+    Read-Host "Press Enter to menu..."
+}
+
+function Show-StorageHealth {
+    Show-Header
+    Write-Host "Fetching storage metrics from CloudWatch..." -ForegroundColor Cyan
+
+    try {
+        $instances = Get-RDSInstances
+        if (-not $instances -or $instances.Count -eq 0) {
+            Write-Host "No RDS instances found." -ForegroundColor Yellow
+            Read-Host "Press Enter to menu..."; return
+        }
+
+        $exportData = [System.Collections.Generic.List[PSCustomObject]]::new()
+        Write-Host ""
+        Write-Host ("  {0,-40} {1,-12} {2,-12} {3,-8} {4}" -f "Instance", "AllocatedGB", "FreeGB", "Used%", "Status") -ForegroundColor White
+        Write-Host "  $('-' * 90)" -ForegroundColor DarkGray
+
+        foreach ($inst in $instances) {
+            $id = $inst.DBInstanceIdentifier
+            $allocGB = $inst.AllocatedStorage
+            $allocBytes = $allocGB * 1GB
+            $freeGB = "-"; $usedPct = "-"; $rowColor = "White"
+
+            try {
+                $end   = (Get-Date).ToUniversalTime()
+                $start = $end.AddMinutes(-10)
+                $cwArgs = @(
+                    "cloudwatch", "get-metric-statistics",
+                    "--namespace", "AWS/RDS",
+                    "--metric-name", "FreeStorageSpace",
+                    "--dimensions", "Name=DBInstanceIdentifier,Value=$id",
+                    "--start-time", $start.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    "--end-time",   $end.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    "--period", "300", "--statistics", "Average",
+                    "--output", "json", "--profile", $global:AWSProfile
+                )
+                $json = (Invoke-AWS-WithRetry -Arguments $cwArgs -ReturnJson) -join ""
+                if (![string]::IsNullOrWhiteSpace($json)) {
+                    $data = $json | ConvertFrom-Json
+                    if ($data.Datapoints -and $data.Datapoints.Count -gt 0) {
+                        $freeBytes = ($data.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1).Average
+                        $freeGB    = [math]::Round($freeBytes / 1GB, 1)
+                        $pct       = [math]::Round(($allocBytes - $freeBytes) / $allocBytes * 100, 1)
+                        $usedPct   = $pct
+                        $rowColor  = if ($pct -ge 90) { "Red" } elseif ($pct -ge 80) { "Yellow" } else { "Green" }
+                    }
+                }
+            } catch {}
+
+            Write-Host ("  {0,-40} {1,-12} {2,-12} {3,-8} {4}" -f $id, $allocGB, $freeGB, $usedPct, $inst.DBInstanceStatus) -ForegroundColor $rowColor
+            $exportData.Add([PSCustomObject]@{
+                Instance    = $id
+                AllocatedGB = $allocGB
+                FreeGB      = $freeGB
+                UsedPct     = $usedPct
+                Status      = $inst.DBInstanceStatus
+            })
+        }
+        Write-Host ""
+        Export-Report -Data $exportData -DefaultFileName "StorageHealth-$(Get-TimeStamp)"
+    } catch {
+        Write-Host "Error: $_" -ForegroundColor Red
+    }
+    Read-Host "Press Enter to menu..."
+}
+
 function Show-InstanceReports-Menu {
     if (!$global:SelectedInstance) {
         Write-Host "No active instance selected. Please select an instance first." -ForegroundColor Yellow
@@ -2776,16 +3001,18 @@ function Show-InstanceReports-Menu {
 
 function Show-OtherReports-Menu {
     while ($true) {
-        $menuOptions = @("Pending OS Upgrade", "DB All Details", "DB Versions (Compact)", "Recommendation list", "CloudWatch Alarms (RDS)", "Back")
+        $menuOptions = @("Pending OS Upgrade", "DB All Details", "DB Versions (Compact)", "Recommendation list", "CloudWatch Alarms (RDS)", "Storage Health", "Snapshot Retention Audit", "Back")
         $sel = Show-Menu -Title "Other Reports" -Options $menuOptions
-        
+
         switch ($sel) {
             0 { Show-PendingMaintenance }
             1 { Show-DBAllDetails }
             2 { Show-DBVersionsCompact }
             3 { Show-RDSRecommendations }
             4 { Show-CloudWatchAlarms }
-            5 { return }
+            5 { Show-StorageHealth }
+            6 { Show-SnapshotRetentionAudit }
+            7 { return }
         }
     }
 }
@@ -2851,6 +3078,10 @@ function New-RDSSnapshot-Interactive {
     $inputName = Read-Host "Enter snapshot name [Press Enter for default]"
     
     $snapName = if ([string]::IsNullOrWhiteSpace($inputName)) { $defaultSnapName } else { $inputName }
+    if ($snapName -notmatch '^[a-zA-Z][a-zA-Z0-9\-]{0,254}$') {
+        Write-Host "Invalid name. Use letters, digits, hyphens only (must start with letter)." -ForegroundColor Red
+        return
+    }
 
     $retry = $true
     while ($retry) {
@@ -3564,7 +3795,8 @@ function New-BGDeployment-Interactive {
 
         Write-Log "Deployment Created Successfully!" -ForegroundColor Cyan
         Write-Log "BG Identifier: $bgId" -ForegroundColor Yellow
-        Write-Log "Use the 'Monitor' function to track progress." 
+        Write-Log "Use the 'Monitor' function to track progress."
+        $script:BGDeploymentsCache = $null
     } catch {
         $err = $_
         $msg = if ($err.Exception) { $err.Exception.Message } else { $err.ToString() }
@@ -3780,6 +4012,7 @@ function Monitor-BGStatus-Interactive {
             [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  TASKS:" -Color Yellow) $winWidth))
             [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  ────────────────────────────────────────────────────────────────────" -Color DarkGray) $winWidth))
 
+            $textInfo = (Get-Culture).TextInfo
             foreach ($task in $bg.Tasks) {
                 $icon = switch ($task.Status) {
                     "COMPLETED" { "[#]" }
@@ -3797,7 +4030,7 @@ function Monitor-BGStatus-Interactive {
                 }
                 $taskName = ($task.Name -replace '_', ' ').ToLower()
                 # Capitalize first letter of each word
-                $taskName = (Get-Culture).TextInfo.ToTitleCase($taskName)
+                $taskName = $textInfo.ToTitleCase($taskName)
 
                 $taskLine = "  $icon $("{0,-45}" -f $taskName) $($task.Status)"
                 [void]$sb.AppendLine((Pad-Line (Get-AnsiString $taskLine -Color $taskColor) $winWidth))
@@ -4004,6 +4237,7 @@ function Remove-BGDeployment-Interactive {
         $bgDelArgs = @("rds", "delete-blue-green-deployment", "--blue-green-deployment-identifier", $bgId, "--no-delete-target", "--profile", $global:AWSProfile)
         Invoke-AWS-WithRetry -Arguments $bgDelArgs | Out-Null
         Write-Host "Deployment deletion initiated." -ForegroundColor Green
+        $script:BGDeploymentsCache = $null
     } catch {
         Write-Host "Failed to delete BG Deployment: $_" -ForegroundColor Red
         Read-Host "Press Enter to menu..."
@@ -4385,6 +4619,7 @@ function Invoke-Switchover-Interactive {
         $swArgs = @("rds", "switchover-blue-green-deployment", "--blue-green-deployment-identifier", $bgId, "--switchover-timeout", $timeout, "--profile", $global:AWSProfile)
         Invoke-AWS-WithRetry -Arguments $swArgs | Out-Null
         $global:RDSInstancesCache = $null
+        $script:BGDeploymentsCache = $null
         Write-Log "Switchover zainicjowany! Oczekiwanie na zakonczenie..." -ForegroundColor Cyan
 
         # Poll for completion (max ~10 minutes)
@@ -4405,9 +4640,10 @@ function Invoke-Switchover-Interactive {
             Write-Host ""
             Write-Host "  Switchover zakonczony pomyslnie." -ForegroundColor Green
             $global:RDSInstancesCache = $null
+            $script:BGDeploymentsCache = $null
 
             # Resolve old Blue identifier after role swap
-            $bgAfter = Get-BlueGreenDeployments | Where-Object { $_.BlueGreenDeploymentIdentifier -eq $bgId }
+            $bgAfter = Get-BlueGreenDeployments -Force | Where-Object { $_.BlueGreenDeploymentIdentifier -eq $bgId }
             $oldBlueId = if ($bgAfter) { Get-InstanceIdFromArn $bgAfter.Source } else { $sourceId }
 
             # Ask about stopping old Blue
@@ -4732,8 +4968,8 @@ function Remove-RDS-Interactive {
                     Invoke-AWS-WithRetry -Arguments $modArgs -ReturnJson | Out-Null
                     Write-Host "Deletion protection disabled." -ForegroundColor Green
                 } catch {
-                    Write-Host "Failed to disable deletion protection for ${id}: $_" -ForegroundColor Red
-                    # We continue attempting deletion, though it will likely fail if protection is still on.
+                    Write-Host "  Failed to disable deletion protection for '$id' — skipping: $_" -ForegroundColor Red
+                    continue
                 }
             }
 
@@ -4831,7 +5067,7 @@ function Stop-RDS-Interactive {
     }
 
     $confirm = Read-Host "Type 'STOP' to confirm shutdown of these instances"
-    if ($confirm -eq "STOP") {
+    if ($confirm.ToUpper() -eq "STOP") {
         foreach ($idx in $selectedIndices) {
             $inst = $instances[$idx]
             $id = $inst.DBInstanceIdentifier
@@ -4847,7 +5083,11 @@ function Stop-RDS-Interactive {
             }
         }
     } else {
-        Write-Host "Operation cancelled." -ForegroundColor Yellow
+        if (![string]::IsNullOrWhiteSpace($confirm)) {
+            Write-Host "  Expected 'STOP', got '$confirm' — operation cancelled." -ForegroundColor Yellow
+        } else {
+            Write-Host "  Operation cancelled." -ForegroundColor Yellow
+        }
     }
     Read-Host "Press Enter to menu..."
 }
@@ -4857,8 +5097,6 @@ function Check-For-Updates-Silent {
         # Force TLS 1.2 for GitHub connection compatibility
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-        $webClient = New-Object System.Net.WebClient
-        $webClient.Headers.Add("User-Agent", "RDS-BG-Manager")
         # Use HttpWebRequest internally with timeout to avoid hanging on unreachable hosts
         $uri = [System.Uri]::new($global:UpdateUrl)
         $request = [System.Net.HttpWebRequest]::Create($uri)
@@ -4878,10 +5116,8 @@ function Check-For-Updates-Silent {
             $remoteVerStr = $matches[1]
             
             # Parse current version
-            $scriptPath = $MyInvocation.MyCommand.Path
-            if ([string]::IsNullOrWhiteSpace($scriptPath)) {
-                $scriptPath = $PSCommandPath
-            }
+            $scriptPath = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { $null }
+            if (-not $scriptPath) { return $null }
             if ([string]::IsNullOrWhiteSpace($scriptPath)) {
                 # Fallback to current directory if all else fails
                 $scriptPath = Join-Path $PSScriptRoot "rds_bg_manager.ps1"
@@ -4930,6 +5166,19 @@ function Check-For-Updates-Interactive {
                 $backupPath = "$($updateInfo.ScriptPath).bak"
                 Copy-Item -Path $updateInfo.ScriptPath -Destination $backupPath -Force
                 Write-Host "Backup saved to: $backupPath" -ForegroundColor Gray
+
+                # Validate downloaded content has a higher version before writing
+                if ($updateInfo.NewContent -match '# VERSION:\s*(\d+\.\d+\.\d+\.\d+)') {
+                    $dlVersion = [version]$matches[1]
+                    $currentVersion = if ($updateInfo.CurrentVersion) { [version]$updateInfo.CurrentVersion } else { $null }
+                    if ($currentVersion -and $currentVersion -ge $dlVersion) {
+                        Write-Host "Downloaded version ($dlVersion) is not newer than current. Aborting update." -ForegroundColor Red
+                        return
+                    }
+                } else {
+                    Write-Host "Downloaded file does not contain a valid VERSION header. Aborting update." -ForegroundColor Red
+                    return
+                }
 
                 Set-Content -Path $updateInfo.ScriptPath -Value $updateInfo.NewContent
                 Write-Host "Update successful! Please restart the script." -ForegroundColor Green
@@ -5043,6 +5292,10 @@ function Upgrade-Database-Interactive {
         if ($snapChoice -eq "c") {
             $customName = Read-Host "Enter Snapshot Name"
             if (![string]::IsNullOrWhiteSpace($customName)) {
+                if ($customName -notmatch '^[a-zA-Z][a-zA-Z0-9\-]{0,254}$') {
+                    Write-Host "Invalid name. Use letters, digits, hyphens only (must start with letter)." -ForegroundColor Red
+                    return
+                }
                 $defaultSnapName = $customName
             }
             $snapChoice = "y" # Proceed to create
@@ -5120,92 +5373,182 @@ function Show-ClientInventory {
 
     $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-    $i = 0
-    foreach ($prof in $profiles) {
-        $i++
-        Write-Host "  [$i/$($profiles.Count)] $prof" -ForegroundColor DarkGray -NoNewline
-        $found = 0
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        # PS7+: scan profiles in parallel (up to 5 at a time); each profile returns its own row list
+        $allParallelRows = $profiles | ForEach-Object -Parallel {
+            $prof = $_
+            $localRows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-        # RDS instances (includes Aurora instances)
-        try {
-            $raw = (aws rds describe-db-instances --profile $prof 2>$null) -join ""
-            if ($LASTEXITCODE -eq 0 -and $raw) {
-                ($raw | ConvertFrom-Json).DBInstances | ForEach-Object {
-                    $type = if ($_.Engine -like "aurora*") { "Aurora Instance" } else { "RDS Instance" }
-                    $rows.Add([PSCustomObject]@{
-                        Profile  = $prof
-                        Type     = $type
-                        Name     = $_.DBInstanceIdentifier
-                        Status   = $_.DBInstanceStatus
-                        Engine   = "$($_.Engine) $($_.EngineVersion)"
-                        Class    = $_.DBInstanceClass
-                        Endpoint = if ($_.Endpoint) { $_.Endpoint.Address } else { "-" }
-                    })
-                    $found++
+            # RDS instances (includes Aurora instances)
+            try {
+                $raw = (aws rds describe-db-instances --profile $prof --query "DBInstances[*].{DBInstanceIdentifier:DBInstanceIdentifier,Engine:Engine,EngineVersion:EngineVersion,DBInstanceStatus:DBInstanceStatus,DBInstanceClass:DBInstanceClass,Endpoint:Endpoint}" --output json 2>$null) -join ""
+                if ($LASTEXITCODE -eq 0 -and $raw) {
+                    ($raw | ConvertFrom-Json) | ForEach-Object {
+                        $type = if ($_.Engine -like "aurora*") { "Aurora Instance" } else { "RDS Instance" }
+                        $localRows.Add([PSCustomObject]@{
+                            Profile  = $prof
+                            Type     = $type
+                            Name     = $_.DBInstanceIdentifier
+                            Status   = $_.DBInstanceStatus
+                            Engine   = "$($_.Engine) $($_.EngineVersion)"
+                            Class    = $_.DBInstanceClass
+                            Endpoint = if ($_.Endpoint) { $_.Endpoint.Address } else { "-" }
+                        })
+                    }
                 }
-            }
-        } catch {}
+            } catch {}
 
-        # Aurora clusters
-        try {
-            $raw = (aws rds describe-db-clusters --profile $prof 2>$null) -join ""
-            if ($LASTEXITCODE -eq 0 -and $raw) {
-                ($raw | ConvertFrom-Json).DBClusters | ForEach-Object {
-                    $rows.Add([PSCustomObject]@{
-                        Profile  = $prof
-                        Type     = "Aurora Cluster"
-                        Name     = $_.DBClusterIdentifier
-                        Status   = $_.Status
-                        Engine   = "$($_.Engine) $($_.EngineVersion)"
-                        Class    = "-"
-                        Endpoint = if ($_.Endpoint) { $_.Endpoint } else { "-" }
-                    })
-                    $found++
+            # Aurora clusters
+            try {
+                $raw = (aws rds describe-db-clusters --profile $prof --query "DBClusters[*].{DBClusterIdentifier:DBClusterIdentifier,Status:Status,Engine:Engine,EngineVersion:EngineVersion,Endpoint:Endpoint}" --output json 2>$null) -join ""
+                if ($LASTEXITCODE -eq 0 -and $raw) {
+                    ($raw | ConvertFrom-Json) | ForEach-Object {
+                        $localRows.Add([PSCustomObject]@{
+                            Profile  = $prof
+                            Type     = "Aurora Cluster"
+                            Name     = $_.DBClusterIdentifier
+                            Status   = $_.Status
+                            Engine   = "$($_.Engine) $($_.EngineVersion)"
+                            Class    = "-"
+                            Endpoint = if ($_.Endpoint) { $_.Endpoint } else { "-" }
+                        })
+                    }
                 }
-            }
-        } catch {}
+            } catch {}
 
-        # Blue/Green deployments
-        try {
-            $raw = (aws rds describe-blue-green-deployments --profile $prof 2>$null) -join ""
-            if ($LASTEXITCODE -eq 0 -and $raw) {
-                ($raw | ConvertFrom-Json).BlueGreenDeployments | ForEach-Object {
-                    $rows.Add([PSCustomObject]@{
-                        Profile  = $prof
-                        Type     = "Blue/Green"
-                        Name     = $_.BlueGreenDeploymentName
-                        Status   = $_.Status
-                        Engine   = "-"
-                        Class    = "-"
-                        Endpoint = "-"
-                    })
-                    $found++
+            # Blue/Green deployments
+            try {
+                $raw = (aws rds describe-blue-green-deployments --profile $prof 2>$null) -join ""
+                if ($LASTEXITCODE -eq 0 -and $raw) {
+                    ($raw | ConvertFrom-Json).BlueGreenDeployments | ForEach-Object {
+                        $localRows.Add([PSCustomObject]@{
+                            Profile  = $prof
+                            Type     = "Blue/Green"
+                            Name     = $_.BlueGreenDeploymentName
+                            Status   = $_.Status
+                            Engine   = "-"
+                            Class    = "-"
+                            Endpoint = "-"
+                        })
+                    }
                 }
-            }
-        } catch {}
+            } catch {}
 
-        # EC2 instances (skip terminated)
-        try {
-            $raw = (aws ec2 describe-instances --profile $prof --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" 2>$null) -join ""
-            if ($LASTEXITCODE -eq 0 -and $raw) {
-                ($raw | ConvertFrom-Json).Reservations | ForEach-Object { $_.Instances } | ForEach-Object {
-                    $nameTag = ($_.Tags | Where-Object { $_.Key -eq "Name" } | Select-Object -First 1).Value
-                    $rows.Add([PSCustomObject]@{
-                        Profile  = $prof
-                        Type     = "EC2"
-                        Name     = if ($nameTag) { $nameTag } else { $_.InstanceId }
-                        Status   = $_.State.Name
-                        Engine   = $_.InstanceType
-                        Class    = "-"
-                        Endpoint = if ($_.PrivateIpAddress) { $_.PrivateIpAddress } else { "-" }
-                    })
-                    $found++
+            # EC2 instances (skip terminated)
+            try {
+                $raw = (aws ec2 describe-instances --profile $prof --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" --query "Reservations[].Instances[].{InstanceId:InstanceId,State:State,InstanceType:InstanceType,PrivateIpAddress:PrivateIpAddress,Tags:Tags}" --output json 2>$null) -join ""
+                if ($LASTEXITCODE -eq 0 -and $raw) {
+                    ($raw | ConvertFrom-Json) | ForEach-Object {
+                        $nameTag = ($_.Tags | Where-Object { $_.Key -eq "Name" } | Select-Object -First 1).Value
+                        $localRows.Add([PSCustomObject]@{
+                            Profile  = $prof
+                            Type     = "EC2"
+                            Name     = if ($nameTag) { $nameTag } else { $_.InstanceId }
+                            Status   = $_.State.Name
+                            Engine   = $_.InstanceType
+                            Class    = "-"
+                            Endpoint = if ($_.PrivateIpAddress) { $_.PrivateIpAddress } else { "-" }
+                        })
+                    }
                 }
-            }
-        } catch {}
+            } catch {}
 
-        $countColor = if ($found -gt 0) { "Green" } else { "DarkGray" }
-        Write-Host "  $found resource(s)" -ForegroundColor $countColor
+            return $localRows
+        } -ThrottleLimit 5
+
+        foreach ($profileRows in $allParallelRows) {
+            foreach ($r in $profileRows) { $rows.Add($r) }
+        }
+        Write-Host "  Parallel scan complete — $($rows.Count) resource(s) across $($profiles.Count) profile(s)" -ForegroundColor DarkGray
+    } else {
+        # PS5.1 fallback: sequential scan
+        $i = 0
+        foreach ($prof in $profiles) {
+            $i++
+            Write-Host "  [$i/$($profiles.Count)] $prof" -ForegroundColor DarkGray -NoNewline
+            $found = 0
+
+            # RDS instances (includes Aurora instances)
+            try {
+                $raw = (aws rds describe-db-instances --profile $prof --query "DBInstances[*].{DBInstanceIdentifier:DBInstanceIdentifier,Engine:Engine,EngineVersion:EngineVersion,DBInstanceStatus:DBInstanceStatus,DBInstanceClass:DBInstanceClass,Endpoint:Endpoint}" --output json 2>$null) -join ""
+                if ($LASTEXITCODE -eq 0 -and $raw) {
+                    ($raw | ConvertFrom-Json) | ForEach-Object {
+                        $type = if ($_.Engine -like "aurora*") { "Aurora Instance" } else { "RDS Instance" }
+                        $rows.Add([PSCustomObject]@{
+                            Profile  = $prof
+                            Type     = $type
+                            Name     = $_.DBInstanceIdentifier
+                            Status   = $_.DBInstanceStatus
+                            Engine   = "$($_.Engine) $($_.EngineVersion)"
+                            Class    = $_.DBInstanceClass
+                            Endpoint = if ($_.Endpoint) { $_.Endpoint.Address } else { "-" }
+                        })
+                        $found++
+                    }
+                }
+            } catch {}
+
+            # Aurora clusters
+            try {
+                $raw = (aws rds describe-db-clusters --profile $prof --query "DBClusters[*].{DBClusterIdentifier:DBClusterIdentifier,Status:Status,Engine:Engine,EngineVersion:EngineVersion,Endpoint:Endpoint}" --output json 2>$null) -join ""
+                if ($LASTEXITCODE -eq 0 -and $raw) {
+                    ($raw | ConvertFrom-Json) | ForEach-Object {
+                        $rows.Add([PSCustomObject]@{
+                            Profile  = $prof
+                            Type     = "Aurora Cluster"
+                            Name     = $_.DBClusterIdentifier
+                            Status   = $_.Status
+                            Engine   = "$($_.Engine) $($_.EngineVersion)"
+                            Class    = "-"
+                            Endpoint = if ($_.Endpoint) { $_.Endpoint } else { "-" }
+                        })
+                        $found++
+                    }
+                }
+            } catch {}
+
+            # Blue/Green deployments
+            try {
+                $raw = (aws rds describe-blue-green-deployments --profile $prof 2>$null) -join ""
+                if ($LASTEXITCODE -eq 0 -and $raw) {
+                    ($raw | ConvertFrom-Json).BlueGreenDeployments | ForEach-Object {
+                        $rows.Add([PSCustomObject]@{
+                            Profile  = $prof
+                            Type     = "Blue/Green"
+                            Name     = $_.BlueGreenDeploymentName
+                            Status   = $_.Status
+                            Engine   = "-"
+                            Class    = "-"
+                            Endpoint = "-"
+                        })
+                        $found++
+                    }
+                }
+            } catch {}
+
+            # EC2 instances (skip terminated)
+            try {
+                $raw = (aws ec2 describe-instances --profile $prof --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" --query "Reservations[].Instances[].{InstanceId:InstanceId,State:State,InstanceType:InstanceType,PrivateIpAddress:PrivateIpAddress,Tags:Tags}" --output json 2>$null) -join ""
+                if ($LASTEXITCODE -eq 0 -and $raw) {
+                    ($raw | ConvertFrom-Json) | ForEach-Object {
+                        $nameTag = ($_.Tags | Where-Object { $_.Key -eq "Name" } | Select-Object -First 1).Value
+                        $rows.Add([PSCustomObject]@{
+                            Profile  = $prof
+                            Type     = "EC2"
+                            Name     = if ($nameTag) { $nameTag } else { $_.InstanceId }
+                            Status   = $_.State.Name
+                            Engine   = $_.InstanceType
+                            Class    = "-"
+                            Endpoint = if ($_.PrivateIpAddress) { $_.PrivateIpAddress } else { "-" }
+                        })
+                        $found++
+                    }
+                }
+            } catch {}
+
+            $countColor = if ($found -gt 0) { "Green" } else { "DarkGray" }
+            Write-Host "  $found resource(s)" -ForegroundColor $countColor
+        }
     }
 
     Write-Host ""
