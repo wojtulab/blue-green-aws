@@ -1,4 +1,4 @@
-# VERSION: 2026.05.26.01
+# VERSION: 2026.06.16.01
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,12 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-05-27
+    - FEATURE: Client Resource Inventory (`Show-ClientInventory`) — new Main Menu option that scans all AWS profiles within a selected SSO session (client) and lists every RDS instance, Aurora instance, Aurora cluster, Blue/Green deployment, and EC2 instance (terminated excluded) with per-profile progress. Columns: Profile, Type, Name, Status, Engine, Class, Endpoint. Sorted by Profile → Type → Name. Supports CSV/HTML export via `Export-Report`. Errors (AccessDenied, no resources) are silently skipped per profile.
+
+    2026-05-26 (Part 2)
+    - STARTUP: Added `Test-StartupDependencies` check at launch — verifies PowerShell version (5.1 OK, 7 recommended; below 5.1 → fatal), AWS CLI v2 presence (v1 or missing → fatal), and `~/.aws/config` existence with at least one profile/SSO session (warning only). Provides `winget` install hints for missing components. Script exits with message on critical failures.
+
     2026-05-26
     - BUGFIX: Fixed "Missing sso_start_url / sso_region" error for cross-account role profiles (e.g. VESA_BOOMI, VESA_PROD, veri-campus). These profiles use `source_profile` chaining, not a direct `sso_session`. `aws sso login` must target the root SSO profile. Added `Resolve-SSOLoginProfile` which walks the `source_profile` chain to find the correct login target.
     - BUGFIX: `Get-AWSConfigData` now exposes `SourceProfiles` (child → parent map) in its return value so the chain can be resolved without re-parsing the config file.
@@ -5013,9 +5019,13 @@ function Upgrade-Database-Interactive {
         Write-Host "REMINDER: Disable monitoring before proceeding!" -ForegroundColor Red -BackgroundColor Yellow
         Write-Host "------------------------------------------"
 
-        # Check Read-Only Profile
-        $isReadOnly = $global:AWSProfile -match "ro" -or $global:AWSProfile -match "readonly"
-        
+        # Check Read-Only Profile — use parsed 'type' field from ~/.aws/config, fall back to name heuristic
+        $profileType = $null
+        if ($global:AWSConfigMetadata -and $global:AWSConfigMetadata.ContainsKey($global:AWSProfile)) {
+            $profileType = $global:AWSConfigMetadata[$global:AWSProfile]['Type']
+        }
+        $isReadOnly = if ($profileType) { $profileType -eq "ro" } else { $global:AWSProfile -match "(?i)(^|[-_])ro($|[-_])" -or $global:AWSProfile -match "(?i)readonly" }
+
         if ($isReadOnly) {
             Write-Host "`n[BLOCK] You are using a Read-Only profile ('$global:AWSProfile')." -ForegroundColor Red
             Write-Host "Upgrade cannot be performed. This is a simulation." -ForegroundColor Yellow
@@ -5087,9 +5097,208 @@ function Upgrade-Database-Interactive {
     Read-Host "Press Enter to menu..."
 }
 
+function Show-ClientInventory {
+    $configData = if ($global:AWSConfigDataCache) { $global:AWSConfigDataCache } else { Get-AWSConfigData }
+    $sessions = @($configData.Sessions.Keys | Sort-Object)
+
+    if ($sessions.Count -eq 0) {
+        Write-Host "No SSO sessions found in AWS config." -ForegroundColor Yellow
+        Read-Host "Press Enter to menu..."; return
+    }
+
+    $idx = Show-Menu -Title "Client Resource Inventory — Select Client" -Options $sessions -EnableFilter
+    if ($idx -lt 0) { return }
+
+    $sessionName  = $sessions[$idx]
+    $profiles     = @($configData.Sessions[$sessionName] | Sort-Object)
+
+    Clear-Host
+    Write-Host ""
+    Write-Host "  Client Resource Inventory: $sessionName" -ForegroundColor Cyan
+    Write-Host "  Scanning $($profiles.Count) profile(s) — RDS, Aurora, Blue/Green, EC2" -ForegroundColor Gray
+    Write-Host ""
+
+    $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    $i = 0
+    foreach ($prof in $profiles) {
+        $i++
+        Write-Host "  [$i/$($profiles.Count)] $prof" -ForegroundColor DarkGray -NoNewline
+        $found = 0
+
+        # RDS instances (includes Aurora instances)
+        try {
+            $raw = (aws rds describe-db-instances --profile $prof 2>$null) -join ""
+            if ($LASTEXITCODE -eq 0 -and $raw) {
+                ($raw | ConvertFrom-Json).DBInstances | ForEach-Object {
+                    $type = if ($_.Engine -like "aurora*") { "Aurora Instance" } else { "RDS Instance" }
+                    $rows.Add([PSCustomObject]@{
+                        Profile  = $prof
+                        Type     = $type
+                        Name     = $_.DBInstanceIdentifier
+                        Status   = $_.DBInstanceStatus
+                        Engine   = "$($_.Engine) $($_.EngineVersion)"
+                        Class    = $_.DBInstanceClass
+                        Endpoint = if ($_.Endpoint) { $_.Endpoint.Address } else { "-" }
+                    })
+                    $found++
+                }
+            }
+        } catch {}
+
+        # Aurora clusters
+        try {
+            $raw = (aws rds describe-db-clusters --profile $prof 2>$null) -join ""
+            if ($LASTEXITCODE -eq 0 -and $raw) {
+                ($raw | ConvertFrom-Json).DBClusters | ForEach-Object {
+                    $rows.Add([PSCustomObject]@{
+                        Profile  = $prof
+                        Type     = "Aurora Cluster"
+                        Name     = $_.DBClusterIdentifier
+                        Status   = $_.Status
+                        Engine   = "$($_.Engine) $($_.EngineVersion)"
+                        Class    = "-"
+                        Endpoint = if ($_.Endpoint) { $_.Endpoint } else { "-" }
+                    })
+                    $found++
+                }
+            }
+        } catch {}
+
+        # Blue/Green deployments
+        try {
+            $raw = (aws rds describe-blue-green-deployments --profile $prof 2>$null) -join ""
+            if ($LASTEXITCODE -eq 0 -and $raw) {
+                ($raw | ConvertFrom-Json).BlueGreenDeployments | ForEach-Object {
+                    $rows.Add([PSCustomObject]@{
+                        Profile  = $prof
+                        Type     = "Blue/Green"
+                        Name     = $_.BlueGreenDeploymentName
+                        Status   = $_.Status
+                        Engine   = "-"
+                        Class    = "-"
+                        Endpoint = "-"
+                    })
+                    $found++
+                }
+            }
+        } catch {}
+
+        # EC2 instances (skip terminated)
+        try {
+            $raw = (aws ec2 describe-instances --profile $prof --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" 2>$null) -join ""
+            if ($LASTEXITCODE -eq 0 -and $raw) {
+                ($raw | ConvertFrom-Json).Reservations | ForEach-Object { $_.Instances } | ForEach-Object {
+                    $nameTag = ($_.Tags | Where-Object { $_.Key -eq "Name" } | Select-Object -First 1).Value
+                    $rows.Add([PSCustomObject]@{
+                        Profile  = $prof
+                        Type     = "EC2"
+                        Name     = if ($nameTag) { $nameTag } else { $_.InstanceId }
+                        Status   = $_.State.Name
+                        Engine   = $_.InstanceType
+                        Class    = "-"
+                        Endpoint = if ($_.PrivateIpAddress) { $_.PrivateIpAddress } else { "-" }
+                    })
+                    $found++
+                }
+            }
+        } catch {}
+
+        $countColor = if ($found -gt 0) { "Green" } else { "DarkGray" }
+        Write-Host "  $found resource(s)" -ForegroundColor $countColor
+    }
+
+    Write-Host ""
+    Write-Host "  Total: $($rows.Count) resource(s) across $($profiles.Count) profile(s)" -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($rows.Count -eq 0) {
+        Write-Host "  No resources found. Check that SSO tokens are valid for this client." -ForegroundColor Yellow
+        Read-Host "Press Enter to menu..."
+        return
+    }
+
+    $sorted = $rows | Sort-Object Profile, Type, Name
+    $sorted | Format-Table -AutoSize | Out-Host
+
+    Export-Report -Data $sorted -DefaultFileName "inventory_${sessionName}_$(Get-TimeStamp)"
+}
+
+function Test-StartupDependencies {
+    $critical = $true
+    Write-Host ""
+    Write-Host "  Dependency check" -ForegroundColor Cyan
+    Write-Host "  ----------------" -ForegroundColor DarkGray
+
+    # PowerShell version
+    $psVer = $PSVersionTable.PSVersion
+    if ($psVer.Major -ge 7) {
+        Write-Host "  [OK] PowerShell $($psVer.ToString())" -ForegroundColor Green
+    } elseif ($psVer.Major -ge 5) {
+        Write-Host "  [OK] PowerShell $($psVer.ToString())  (upgrade to PS 7 recommended for parallel execution)" -ForegroundColor Yellow
+        Write-Host "       winget install --id Microsoft.PowerShell --source winget" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  [!!] PowerShell $($psVer.ToString()) is not supported — please upgrade to 5.1 or 7+." -ForegroundColor Red
+        $critical = $false
+    }
+
+    # AWS CLI
+    try {
+        $awsVerRaw = & aws --version 2>&1
+        $awsVerStr = "$awsVerRaw"
+        if ($awsVerStr -match "aws-cli/(\d+)") {
+            if ([int]$matches[1] -ge 2) {
+                $shortVer = ($awsVerStr -split ' ')[0]
+                Write-Host "  [OK] $shortVer" -ForegroundColor Green
+            } else {
+                Write-Host "  [!!] AWS CLI v1 detected — v2 is required." -ForegroundColor Red
+                Write-Host "       winget install --id Amazon.AWSCLI --source winget" -ForegroundColor DarkGray
+                $critical = $false
+            }
+        } else {
+            Write-Host "  [OK] AWS CLI found" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  [!!] AWS CLI not found — install AWS CLI v2 to continue." -ForegroundColor Red
+        Write-Host "       winget install --id Amazon.AWSCLI --source winget" -ForegroundColor DarkGray
+        $critical = $false
+    }
+
+    # AWS config file
+    $awsConfigPath = Join-Path (Get-AWSDirectoryPath) "config"
+    if (Test-Path $awsConfigPath) {
+        try {
+            $content = Get-Content $awsConfigPath -Raw
+            $profiles = ([regex]::Matches($content, '(?m)^\[profile\s')).Count
+            $sessions = ([regex]::Matches($content, '(?m)^\[sso-session\s')).Count
+            if ($profiles -gt 0 -or $sessions -gt 0) {
+                Write-Host "  [OK] AWS config ($profiles profile(s), $sessions SSO session(s))  — $awsConfigPath" -ForegroundColor Green
+            } else {
+                Write-Host "  [??] AWS config exists but has no profiles or SSO sessions." -ForegroundColor Yellow
+                Write-Host "       Run: aws configure sso" -ForegroundColor DarkGray
+            }
+        } catch {
+            Write-Host "  [??] AWS config found but could not be read: $_" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  [??] AWS config not found at: $awsConfigPath" -ForegroundColor Yellow
+        Write-Host "       Run: aws configure sso" -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+    return $critical
+}
+
 # --- INITIALIZATION ---
 
 if ($MyInvocation.InvocationName -ne '.') {
+    # Dependency check — abort on critical failures (missing AWS CLI, unsupported PS)
+    if (-not (Test-StartupDependencies)) {
+        Write-Host "One or more critical dependencies are missing. Please resolve them and restart the script." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+
     # Startup Update Check
     Write-Host "Checking for updates..." -ForegroundColor Gray
     $global:UpdateAvailable = Check-For-Updates-Silent
@@ -5139,6 +5348,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             $menuOptions = @(
                 "RDS Management",
                 "EC2 Management",
+                "Client Resource Inventory",
                 "AWS Sessions (Assume/Granted)",
                 "Quit"
             )
@@ -5150,8 +5360,9 @@ if ($MyInvocation.InvocationName -ne '.') {
             switch ($selection) {
                 0 { Show-RDS-Menu }
                 1 { Show-EC2-Menu }
-                2 { Show-AWSSessions-Menu }
-                3 {
+                2 { Show-ClientInventory }
+                3 { Show-AWSSessions-Menu }
+                4 {
                     # Restore cursor before exit
                     try { [Console]::CursorVisible = $true } catch {}
                     Clear-Host
