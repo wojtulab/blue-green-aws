@@ -1,4 +1,4 @@
-# VERSION: 2026.06.16.02
+# VERSION: 2026.06.17.01
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,32 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-06-17
+    - FEATURE: Tag Management (`Set-RDSMonitoringTag-Interactive`) — multi-select RDS instances and toggle SSG-MONITORING tag (ENABLE/DISABLE). Instances without the tag are skipped with a message (tag is never created from scratch).
+    - FEATURE: `Invoke-MonitoringTagToggle` — inline helper to toggle SSG-MONITORING on a single instance; used by keyboard shortcut M in upgrade/BG flows.
+    - UX: Press M in `Upgrade-Database-Interactive` confirmation screen to toggle SSG-MONITORING before proceeding. Loop allows multiple toggles; tag value refreshes after each change.
+    - UX: Press M in `Monitor-BGStatus-Interactive` live dashboard to toggle SSG-MONITORING on Blue (Source) instance. Monitor pauses, applies change, resumes on Enter.
+    - UX: Press M in `New-BGDeployment-Interactive` wizard before deployment creation to toggle SSG-MONITORING on source instance.
+    - UX: Upgrade Confirmation screen shows SSG-MONITORING tag value (red=ENABLE, green=DISABLE, gray=not set).
+    - UX: Tag Management selection list shows colored ENABLE/GREEN, DISABLE/RED, ---/GRAY values with column headers (Instance / Monitoring / Status) and F5 refresh.
+    - BUGFIX: Read-Only profile detection uses `type` field from `~/.aws/config` metadata instead of profile name regex — fixes false positive on profiles like SUDAC-PROD that contain "ro" in name.
+    - BUGFIX: Manual snapshot count now sums instance snapshots + Aurora cluster snapshots (was instance-only). Quota fetched from AWS Service Quotas API (L-272F1212) instead of hardcoded 100.
+    - BUGFIX: Snapshot quota check now supports force-bypass option (F key) to proceed despite quota warning.
+    - BUGFIX: Retry loop condition fixed (`-lt` instead of `-le`) — was executing 4 retries instead of 3.
+    - SECURITY: OTA download validates downloaded version is strictly newer than current before applying.
+    - SECURITY: SSO URL validated against `*.awsapps.com` domain before opening browser via `Start-Process`.
+    - SECURITY: Snapshot name sanitized — must match `^[a-zA-Z][a-zA-Z0-9\-]{0,254}$`.
+    - SECURITY: `UpdateUrl` forced to https:// at config load; invalid values are nulled out.
+    - SECURITY: Delete-RDS loop uses `continue` on deletion-protection disable failure instead of aborting.
+    - SECURITY: STOP confirmation now case-insensitive (`.ToUpper() -eq "STOP"`).
+    - FEATURE: Storage Health report (`Show-StorageHealth`) — per-instance FreeStorageSpace from CloudWatch, Used% with color coding (red ≥90%, yellow ≥80%). In Other Reports menu.
+    - FEATURE: Snapshot Retention Audit (`Show-SnapshotRetentionAudit`) — all manual snapshots with age buckets (<7d / 7-30d / 30-90d / >90d), quota usage bar, per-row age coloring. In Other Reports menu.
+    - FEATURE: `Monitor-RDS-State` shows CPU% and Connections columns when terminal width ≥160 (fetched via `Get-RDSCloudWatchMetrics`).
+    - PERFORMANCE: Blue/Green deployments cached (`$script:BGDeploymentsCache`) with 60s TTL; cache invalidated after create/delete/switchover.
+    - PERFORMANCE: `ClientInventory` runs parallel AWS calls on PS7 (`ForEach-Object -Parallel -ThrottleLimit 5`); sequential fallback on PS5.1.
+    - PERFORMANCE: `--query` projections added to all 3 ClientInventory AWS describe calls to reduce payload.
+    - PERFORMANCE: `(Get-Culture).TextInfo` cached before task loop in BG monitor to avoid per-iteration culture lookup.
+
     2026-05-27
     - FEATURE: Client Resource Inventory (`Show-ClientInventory`) — new Main Menu option that scans all AWS profiles within a selected SSO session (client) and lists every RDS instance, Aurora instance, Aurora cluster, Blue/Green deployment, and EC2 instance (terminated excluded) with per-profile progress. Columns: Profile, Type, Name, Status, Engine, Class, Endpoint. Sorted by Profile → Type → Name. Supports CSV/HTML export via `Export-Report`. Errors (AccessDenied, no resources) are silently skipped per profile.
 
@@ -2110,10 +2136,16 @@ function Set-RDSMonitoringTag-Interactive {
     Write-Host ""
     Write-Host "Setting SSG-MONITORING=$tagValue on $($selected.Count) instance(s)..." -ForegroundColor $tagColor
 
-    $ok = 0; $fail = 0
+    $ok = 0; $fail = 0; $skip = 0
     foreach ($inst in $selected) {
-        $id   = $inst.DBInstanceIdentifier
-        $arn  = $inst.DBInstanceArn
+        $id      = $inst.DBInstanceIdentifier
+        $arn     = $inst.DBInstanceArn
+        $tagVal  = ($inst.TagList | Where-Object { $_.Key -eq "SSG-MONITORING" } | Select-Object -First 1).Value
+        if (-not $tagVal) {
+            Write-Host "  SKIP $id — tag SSG-MONITORING does not exist" -ForegroundColor DarkGray
+            $skip++
+            continue
+        }
         try {
             Invoke-AWS-WithRetry -Arguments @(
                 "rds", "add-tags-to-resource",
@@ -2130,9 +2162,44 @@ function Set-RDSMonitoringTag-Interactive {
     }
 
     Write-Host ""
-    Write-Host "Done: $ok OK, $fail failed." -ForegroundColor $(if ($fail -gt 0) { "Yellow" } else { "Green" })
+    Write-Host "Done: $ok OK, $fail failed, $skip skipped (tag not present)." -ForegroundColor $(if ($fail -gt 0) { "Yellow" } else { "Green" })
     $global:RDSInstancesCache = $null  # invalidate so tag values refresh on next load
     Read-Host "Press Enter to menu..."
+}
+
+function Invoke-MonitoringTagToggle {
+    param(
+        [string]$InstanceId,
+        [string]$InstanceArn,
+        [object[]]$TagList
+    )
+    $tagVal = ($TagList | Where-Object { $_.Key -eq "SSG-MONITORING" } | Select-Object -First 1).Value
+    if (-not $tagVal) {
+        Write-Host "  SSG-MONITORING tag does not exist on '$InstanceId' — nothing to toggle." -ForegroundColor DarkGray
+        Read-Host "  Press Enter to continue..."
+        return $false
+    }
+    $newVal   = if ($tagVal -eq "ENABLE") { "DISABLE" } else { "ENABLE" }
+    $newColor = if ($newVal -eq "ENABLE") { "Green" } else { "DarkYellow" }
+    Write-Host ""
+    Write-Host "  SSG-MONITORING on $InstanceId" -ForegroundColor White
+    Write-Host "  Current: $tagVal  →  New: $newVal" -ForegroundColor $newColor
+    $ok = Read-Host "  Confirm toggle? [Y/n]"
+    if ($ok -eq "n" -or $ok -eq "N") { Write-Host "  Cancelled." -ForegroundColor Gray; return $false }
+    try {
+        Invoke-AWS-WithRetry -Arguments @(
+            "rds", "add-tags-to-resource",
+            "--resource-name", $InstanceArn,
+            "--tags", "Key=SSG-MONITORING,Value=$newVal",
+            "--profile", $global:AWSProfile
+        ) | Out-Null
+        Write-Host "  Done: SSG-MONITORING = $newVal on $InstanceId" -ForegroundColor $newColor
+        $global:RDSInstancesCache = $null
+        return $true
+    } catch {
+        Write-Host "  FAIL: $_" -ForegroundColor Red
+        return $false
+    }
 }
 
 function Show-RDS-Menu {
@@ -3863,6 +3930,21 @@ function New-BGDeployment-Interactive {
 
     Write-Host "Green DB Identifier:     (Generated automatically by AWS)" -ForegroundColor Gray
     
+    # Optional: toggle monitoring on source instance before creating deployment
+    $monInstBG = @(Get-CachedRDSInstances | Where-Object { $_.DBInstanceIdentifier -eq $sourceDB })[0]
+    if ($monInstBG) {
+        $monTagValBG = ($monInstBG.TagList | Where-Object { $_.Key -eq "SSG-MONITORING" } | Select-Object -First 1).Value
+        if ($monTagValBG) {
+            $monColorBG = if ($monTagValBG -eq "ENABLE") { "Red" } else { "Green" }
+            Write-Host ""
+            Write-Host "  SSG-MONITORING on ${sourceDB}: $monTagValBG" -ForegroundColor $monColorBG
+            $mKeyBG = Read-Host "  Press M to toggle monitoring tag before deploying, or Enter to skip"
+            if ($mKeyBG -eq "M" -or $mKeyBG -eq "m") {
+                Invoke-MonitoringTagToggle -InstanceId $monInstBG.DBInstanceIdentifier -InstanceArn $monInstBG.DBInstanceArn -TagList $monInstBG.TagList | Out-Null
+            }
+        }
+    }
+
     Write-Log "`nConstructing deployment '$bgName'..." -ForegroundColor Gray
 
     # Use Source ARN instead of Source Identifier
@@ -4159,7 +4241,7 @@ function Monitor-BGStatus-Interactive {
         # Footer separator + instructions
         [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  ────────────────────────────────────────────────────────────────────" -Color DarkGray) $winWidth))
         $refreshTime = Get-Date -Format "HH:mm:ss"
-        [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  Last refresh: $refreshTime | F5: Force Refresh | ENTER/ESC: Exit" -Color DarkGray) $winWidth))
+        [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  Last refresh: $refreshTime | F5: Refresh | M: Toggle Monitoring (Blue) | ENTER/ESC: Exit" -Color DarkGray) $winWidth))
 
         # Blank lines to clear residual text from previous frames
         for ($i = 0; $i -lt 4; $i++) {
@@ -4180,6 +4262,18 @@ function Monitor-BGStatus-Interactive {
                     return
                 }
                 if ($k.Key -eq 'F5') { break }  # Break inner loop to force refresh
+                if ($k.KeyChar -eq 'M' -or $k.KeyChar -eq 'm') {
+                    try { [Console]::CursorVisible = $true } catch {}
+                    $monInst = @(Get-CachedRDSInstances | Where-Object { $_.DBInstanceIdentifier -eq $sourceId })[0]
+                    if ($monInst) {
+                        Invoke-MonitoringTagToggle -InstanceId $sourceId -InstanceArn $monInst.DBInstanceArn -TagList $monInst.TagList | Out-Null
+                    } else {
+                        Write-Host "  Cannot find '$sourceId' in cache." -ForegroundColor Yellow
+                    }
+                    Read-Host "  Press Enter to resume monitor..."
+                    try { [Console]::CursorVisible = $false } catch {}
+                    break  # force frame refresh
+                }
             }
             Start-Sleep -Milliseconds 100
         }
@@ -5390,6 +5484,20 @@ function Upgrade-Database-Interactive {
         Write-Host "------------------------------------------"
         Write-Host "REMINDER: Disable monitoring before proceeding!" -ForegroundColor Red -BackgroundColor Yellow
         Write-Host "------------------------------------------"
+
+        while ($true) {
+            $preKey = Read-Host "[M] Toggle SSG-MONITORING | [Enter] Continue with upgrade"
+            if ($preKey -ne "M" -and $preKey -ne "m") { break }
+            Invoke-MonitoringTagToggle -InstanceId $instance.DBInstanceIdentifier -InstanceArn $instance.DBInstanceArn -TagList $instance.TagList | Out-Null
+            $refreshed = @(Get-CachedRDSInstances -Force | Where-Object { $_.DBInstanceIdentifier -eq $instance.DBInstanceIdentifier })[0]
+            if ($refreshed) {
+                $instance = $refreshed
+                $monTagVal = ($instance.TagList | Where-Object { $_.Key -eq "SSG-MONITORING" } | Select-Object -First 1).Value
+                if (-not $monTagVal) { $monTagVal = "(no tag)" }
+                $monColor = if ($monTagVal -eq "ENABLE") { "Red" } elseif ($monTagVal -eq "DISABLE") { "Green" } else { "Gray" }
+                Write-Host "  SSG-MONITORING: $monTagVal" -ForegroundColor $monColor
+            }
+        }
 
         # Check Read-Only Profile — use parsed 'type' field from ~/.aws/config, fall back to name heuristic
         $profileType = $null
