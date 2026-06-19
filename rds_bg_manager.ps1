@@ -1,4 +1,4 @@
-# VERSION: 2026.06.17.01
+# VERSION: 2026.06.19.01
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -46,6 +46,21 @@
     - BUGFIX: `Get-AWSConfigData` now exposes `SourceProfiles` (child → parent map) in its return value so the chain can be resolved without re-parsing the config file.
     - UX: Added `Invoke-SSOLogin` helper — runs `aws sso login --no-browser` and streams output line-by-line so the verification URL is visible immediately. Once the URL is detected in the stream, the default browser is opened automatically via `Start-Process`. Previously, buffering the full command output caused a silent hang while waiting for auth that never started.
     - UX: Both SSO login paths (`Check-SSOSession` and the expired-token retry in `Invoke-AWS-WithRetry`) now use the new `Invoke-SSOLogin` and `Resolve-SSOLoginProfile` helpers.
+
+    2026-06-19
+    - FEATURE: Full Aurora Cluster snapshot support across all snapshot operations. New helper `Resolve-SnapshotTarget` detects Aurora cluster membership (Engine=aurora* + DBClusterIdentifier) and routes to correct AWS API automatically.
+    - FIX: `New-RDSSnapshot-Interactive` — now calls `create-db-cluster-snapshot` for Aurora cluster members instead of failing with InvalidParameterValue.
+    - FIX: `New-MultipleRDSSnapshots-Interactive` — both sequential (PS5.1) and parallel (PS7) paths now Aurora-aware; task objects carry ClusterIdentifier and IsAurora flags.
+    - FIX: `Remove-RDSSnapshot-Interactive` — fetches and merges both `describe-db-snapshots` (RDS) and `describe-db-cluster-snapshots` (Aurora) into unified list; deletes using correct API per item.
+    - FIX: `Show-RecentSnapshots` / `Show-Last30DaysSnapshots` — route to cluster snapshot API when selected instance is Aurora.
+    - FIX: `Start-PostSwitchoverCleanup` — resolves old source instance via cache to determine Aurora; uses cluster snapshot for cleanup.
+    - FIX: `Update-OperatingSystem` pre-snapshot — Aurora-aware via `Resolve-SnapshotTarget`.
+    - FIX: `Upgrade-Database-Interactive` pre-upgrade snapshot — Aurora-aware; shows target type in UI.
+    - IMPROVEMENT: `Monitor-Snapshot-Progress` — now monitors both instance and cluster snapshots, merged and sorted by recency.
+    - IMPROVEMENT: `Show-SnapshotRetentionAudit` — now includes Aurora cluster snapshots in age-bucket audit and quota count.
+    - FIX: `Upgrade-Database-Interactive` — engine upgrade now uses `modify-db-cluster` for Aurora (was `modify-db-instance`); status parsed from `DBCluster.Status`.
+    - FIX: `Start-PostSwitchoverCleanup` — deletion protection disable and cluster deletion now use `modify-db-cluster` / `delete-db-cluster` for Aurora.
+    - FIX: `New-MultipleRDSSnapshots-Interactive` — deduplicates Aurora instances sharing the same cluster; one snapshot per cluster; warns user about skipped duplicates.
 
     2026-05-25
     - PERFORMANCE: Optimized 'Create Blue/Green Deployment' pre-load sequence. Split pre-load job into two stages: engine-version lookup (fast path, ~3-5s wait) + parameter-group lookup (background job while user selects version). Reduced wait timeouts from 30s → 8s (engine) / 15s (upgrade versions) / 12s (parameter groups). Eliminates ~25s UI freeze during "Finalising pre-load..." for typical AWS call delays.
@@ -341,6 +356,21 @@ function Confirm-SnapshotQuota {
             Write-Log "Quota override: proceeding despite limit ($current/$max)." -ForegroundColor DarkYellow
             return $true
         }
+    }
+}
+
+function Resolve-SnapshotTarget {
+    param([object]$Instance)
+    if ($Instance -is [string]) {
+        $found = (Get-RDSInstances) | Where-Object { $_.DBInstanceIdentifier -eq $Instance } | Select-Object -First 1
+        if ($found) { $Instance = $found }
+        else { return @{ IsAurora = $false; TargetId = $Instance; Label = "RDS Instance ($Instance)" } }
+    }
+    $isAurora = (-not [string]::IsNullOrEmpty($Instance.DBClusterIdentifier)) -and ($Instance.Engine -like "aurora*")
+    return @{
+        IsAurora = $isAurora
+        TargetId = if ($isAurora) { $Instance.DBClusterIdentifier } else { $Instance.DBInstanceIdentifier }
+        Label    = if ($isAurora) { "Aurora Cluster ($($Instance.DBClusterIdentifier))" } else { "RDS Instance ($($Instance.DBInstanceIdentifier))" }
     }
 }
 
@@ -2116,7 +2146,7 @@ function Set-RDSMonitoringTag-Interactive {
 
     if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
     if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
-    if (-not $selectedIndices -or $selectedIndices.Count -eq 0) {
+    if ($null -eq $selectedIndices -or $selectedIndices.Count -eq 0) {
         Write-Host "No instances selected." -ForegroundColor Yellow
         Read-Host "Press Enter to menu..."; return
     }
@@ -2434,37 +2464,42 @@ function Show-Instance-Details {
 function Show-RecentSnapshots {
     Show-Header
     $id = $global:SelectedInstance.DBInstanceIdentifier
-    Write-Host "Fetching recent snapshots for $id..." -ForegroundColor Green
-    
+    $target = Resolve-SnapshotTarget -Instance $global:SelectedInstance
+    Write-Host "Fetching recent snapshots for $id ($($target.Label))..." -ForegroundColor Green
+
     try {
-        $snapArgs = @("rds", "describe-db-snapshots", "--db-instance-identifier", $id, "--output", "json", "--profile", $global:AWSProfile)
-        $snapOutput = Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson
-        $json = $snapOutput -join ""
-        if ([string]::IsNullOrWhiteSpace($json)) { 
-            Write-Host "No snapshots found." -ForegroundColor Yellow
-            Pause
-            return 
+        if ($target.IsAurora) {
+            $snapArgs = @("rds", "describe-db-cluster-snapshots", "--db-cluster-identifier", $target.TargetId, "--output", "json", "--profile", $global:AWSProfile)
+            $snapOutput = Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson
+            $json = $snapOutput -join ""
+            if ([string]::IsNullOrWhiteSpace($json)) { Write-Host "No snapshots found." -ForegroundColor Yellow; Pause; return }
+            $data = $json | ConvertFrom-Json
+            if (!$data.DBClusterSnapshots) { Write-Host "No snapshots found." -ForegroundColor Yellow; Pause; return }
+            $snaps = $data.DBClusterSnapshots | Sort-Object SnapshotCreateTime -Descending | Select-Object -First 5
+            Write-Host "LAST 5 CLUSTER SNAPSHOTS FOR $($target.TargetId):" -ForegroundColor Yellow
+            Write-Host "------------------------------------------------------------"
+            Write-Host ("{0,-35} {1,-20} {2,10}" -f "Identifier", "Create Time", "Size (GB)")
+            Write-Host "------------------------------------------------------------" -ForegroundColor Gray
+            foreach ($s in $snaps) {
+                Write-Host ("{0,-35} {1,-20} {2,10}" -f $s.DBClusterSnapshotIdentifier, $s.SnapshotCreateTime, $s.AllocatedStorage)
+            }
+        } else {
+            $snapArgs = @("rds", "describe-db-snapshots", "--db-instance-identifier", $target.TargetId, "--output", "json", "--profile", $global:AWSProfile)
+            $snapOutput = Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson
+            $json = $snapOutput -join ""
+            if ([string]::IsNullOrWhiteSpace($json)) { Write-Host "No snapshots found." -ForegroundColor Yellow; Pause; return }
+            $data = $json | ConvertFrom-Json
+            if (!$data.DBSnapshots) { Write-Host "No snapshots found." -ForegroundColor Yellow; Pause; return }
+            $snaps = $data.DBSnapshots | Sort-Object SnapshotCreateTime -Descending | Select-Object -First 5
+            Write-Host "LAST 5 SNAPSHOTS FOR $($id):" -ForegroundColor Yellow
+            Write-Host "------------------------------------------------------------"
+            Write-Host ("{0,-35} {1,-20} {2,10}" -f "Identifier", "Create Time", "Size (GB)")
+            Write-Host "------------------------------------------------------------" -ForegroundColor Gray
+            foreach ($s in $snaps) {
+                Write-Host ("{0,-35} {1,-20} {2,10}" -f $s.DBSnapshotIdentifier, $s.SnapshotCreateTime, $s.AllocatedStorage)
+            }
         }
-
-        $data = $json | ConvertFrom-Json
-        if (!$data.DBSnapshots) { 
-            Write-Host "No snapshots found." -ForegroundColor Yellow
-            Pause
-            return 
-        }
-
-        $snaps = $data.DBSnapshots | Sort-Object SnapshotCreateTime -Descending | Select-Object -First 5
-        
-        Write-Host "LAST 5 SNAPSHOTS FOR $($id):" -ForegroundColor Yellow
         Write-Host "------------------------------------------------------------"
-        Write-Host ("{0,-35} {1,-20} {2,10}" -f "Identifier", "Create Time", "Size (GB)")
-        Write-Host "------------------------------------------------------------" -ForegroundColor Gray
-        
-        foreach ($s in $snaps) {
-            Write-Host ("{0,-35} {1,-20} {2,10}" -f $s.DBSnapshotIdentifier, $s.SnapshotCreateTime, $s.AllocatedStorage)
-        }
-        Write-Host "------------------------------------------------------------"
-        
         Export-Report -Data $snaps -DefaultFileName "Snapshots-$id"
         return
     } catch {
@@ -2478,48 +2513,50 @@ function Show-RecentSnapshots {
 function Show-Last30DaysSnapshots {
     Show-Header
     $id = $global:SelectedInstance.DBInstanceIdentifier
-    Write-Host "Fetching snapshots from the last 30 days for $id..." -ForegroundColor Green
-    
+    $target = Resolve-SnapshotTarget -Instance $global:SelectedInstance
+    Write-Host "Fetching snapshots from the last 30 days for $id ($($target.Label))..." -ForegroundColor Green
+
     try {
-        $snapArgs = @("rds", "describe-db-snapshots", "--db-instance-identifier", $id, "--output", "json", "--profile", $global:AWSProfile)
-        $snapOutput = Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson
-        $json = $snapOutput -join ""
-        if ([string]::IsNullOrWhiteSpace($json)) { 
-            Write-Host "No snapshots found." -ForegroundColor Yellow
-            Read-Host "Press Enter to menu..."
-            return 
-        }
-
-        $data = $json | ConvertFrom-Json
-        if (!$data.DBSnapshots) { 
-            Write-Host "No snapshots found." -ForegroundColor Yellow
-            Read-Host "Press Enter to menu..."
-            return 
-        }
-
-        # Filter last 30 days
         $cutoff = (Get-Date).AddDays(-30)
-        
-        $snaps = $data.DBSnapshots | Where-Object { 
-            try { [datetime]$_.SnapshotCreateTime -ge $cutoff } catch { $false }
-        } | Sort-Object SnapshotCreateTime -Descending
-        
-        if (!$snaps) {
-            Write-Host "No snapshots found in the last 30 days." -ForegroundColor Yellow
-            Read-Host "Press Enter to menu..."
-            return
-        }
 
-        Write-Host "SNAPSHOTS (LAST 30 DAYS) FOR $($id):" -ForegroundColor Yellow
-        Write-Host "------------------------------------------------------------"
-        Write-Host ("{0,-35} {1,-20} {2,10}" -f "Identifier", "Create Time", "Size (GB)")
-        Write-Host "------------------------------------------------------------" -ForegroundColor Gray
-        
-        foreach ($s in $snaps) {
-            Write-Host ("{0,-35} {1,-20} {2,10}" -f $s.DBSnapshotIdentifier, $s.SnapshotCreateTime, $s.AllocatedStorage)
+        if ($target.IsAurora) {
+            $snapArgs = @("rds", "describe-db-cluster-snapshots", "--db-cluster-identifier", $target.TargetId, "--output", "json", "--profile", $global:AWSProfile)
+            $snapOutput = Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson
+            $json = $snapOutput -join ""
+            if ([string]::IsNullOrWhiteSpace($json)) { Write-Host "No snapshots found." -ForegroundColor Yellow; Read-Host "Press Enter to menu..."; return }
+            $data = $json | ConvertFrom-Json
+            if (!$data.DBClusterSnapshots) { Write-Host "No snapshots found." -ForegroundColor Yellow; Read-Host "Press Enter to menu..."; return }
+            $snaps = $data.DBClusterSnapshots | Where-Object {
+                try { [datetime]$_.SnapshotCreateTime -ge $cutoff } catch { $false }
+            } | Sort-Object SnapshotCreateTime -Descending
+            if (!$snaps) { Write-Host "No cluster snapshots found in the last 30 days." -ForegroundColor Yellow; Read-Host "Press Enter to menu..."; return }
+            Write-Host "CLUSTER SNAPSHOTS (LAST 30 DAYS) FOR $($target.TargetId):" -ForegroundColor Yellow
+            Write-Host "------------------------------------------------------------"
+            Write-Host ("{0,-35} {1,-20} {2,10}" -f "Identifier", "Create Time", "Size (GB)")
+            Write-Host "------------------------------------------------------------" -ForegroundColor Gray
+            foreach ($s in $snaps) {
+                Write-Host ("{0,-35} {1,-20} {2,10}" -f $s.DBClusterSnapshotIdentifier, $s.SnapshotCreateTime, $s.AllocatedStorage)
+            }
+        } else {
+            $snapArgs = @("rds", "describe-db-snapshots", "--db-instance-identifier", $target.TargetId, "--output", "json", "--profile", $global:AWSProfile)
+            $snapOutput = Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson
+            $json = $snapOutput -join ""
+            if ([string]::IsNullOrWhiteSpace($json)) { Write-Host "No snapshots found." -ForegroundColor Yellow; Read-Host "Press Enter to menu..."; return }
+            $data = $json | ConvertFrom-Json
+            if (!$data.DBSnapshots) { Write-Host "No snapshots found." -ForegroundColor Yellow; Read-Host "Press Enter to menu..."; return }
+            $snaps = $data.DBSnapshots | Where-Object {
+                try { [datetime]$_.SnapshotCreateTime -ge $cutoff } catch { $false }
+            } | Sort-Object SnapshotCreateTime -Descending
+            if (!$snaps) { Write-Host "No snapshots found in the last 30 days." -ForegroundColor Yellow; Read-Host "Press Enter to menu..."; return }
+            Write-Host "SNAPSHOTS (LAST 30 DAYS) FOR $($id):" -ForegroundColor Yellow
+            Write-Host "------------------------------------------------------------"
+            Write-Host ("{0,-35} {1,-20} {2,10}" -f "Identifier", "Create Time", "Size (GB)")
+            Write-Host "------------------------------------------------------------" -ForegroundColor Gray
+            foreach ($s in $snaps) {
+                Write-Host ("{0,-35} {1,-20} {2,10}" -f $s.DBSnapshotIdentifier, $s.SnapshotCreateTime, $s.AllocatedStorage)
+            }
         }
         Write-Host "------------------------------------------------------------"
-        
         Export-Report -Data $snaps -DefaultFileName "Snapshots-30Days-$id"
         return
     } catch {
@@ -3035,6 +3072,7 @@ function Show-SnapshotRetentionAudit {
     Write-Host "Fetching manual snapshots..." -ForegroundColor Cyan
 
     try {
+        # Instance snapshots
         $snapArgs = @(
             "rds", "describe-db-snapshots",
             "--snapshot-type", "manual",
@@ -3042,12 +3080,28 @@ function Show-SnapshotRetentionAudit {
             "--query", "DBSnapshots[*].{DBSnapshotIdentifier:DBSnapshotIdentifier,DBInstanceIdentifier:DBInstanceIdentifier,SnapshotCreateTime:SnapshotCreateTime,AllocatedStorage:AllocatedStorage,Status:Status}",
             "--profile", $global:AWSProfile
         )
-        $json = (Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson) -join ""
-        if ([string]::IsNullOrWhiteSpace($json)) {
-            Write-Host "No snapshot data returned." -ForegroundColor Yellow
-            Read-Host "Press Enter to menu..."; return
-        }
-        $snaps = $json | ConvertFrom-Json
+        $instJson = (Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson) -join ""
+        $instSnaps = if (-not [string]::IsNullOrWhiteSpace($instJson)) { $instJson | ConvertFrom-Json } else { @() }
+        if (-not $instSnaps) { $instSnaps = @() }
+
+        # Aurora cluster snapshots
+        $clusterSnapArgs = @(
+            "rds", "describe-db-cluster-snapshots",
+            "--snapshot-type", "manual",
+            "--output", "json",
+            "--query", "DBClusterSnapshots[*].{DBSnapshotIdentifier:DBClusterSnapshotIdentifier,DBInstanceIdentifier:DBClusterIdentifier,SnapshotCreateTime:SnapshotCreateTime,AllocatedStorage:AllocatedStorage,Status:Status}",
+            "--profile", $global:AWSProfile
+        )
+        $clusterSnaps = @()
+        try {
+            $clusterJson = (Invoke-AWS-WithRetry -Arguments $clusterSnapArgs -ReturnJson) -join ""
+            if (-not [string]::IsNullOrWhiteSpace($clusterJson)) {
+                $parsed = $clusterJson | ConvertFrom-Json
+                if ($parsed) { $clusterSnaps = $parsed }
+            }
+        } catch { Write-Log "Warning: Could not fetch cluster snapshots: $_" -ForegroundColor DarkGray }
+
+        $snaps = @($instSnaps) + @($clusterSnaps)
         if (-not $snaps -or $snaps.Count -eq 0) {
             Write-Host "No manual snapshots found." -ForegroundColor Yellow
             Read-Host "Press Enter to menu..."; return
@@ -3268,11 +3322,18 @@ function New-RDSSnapshot-Interactive {
         return
     }
 
+    $target = Resolve-SnapshotTarget -Instance $global:SelectedInstance
+    Write-Host "(Target: $($target.Label))" -ForegroundColor DarkGray
+
     $retry = $true
     while ($retry) {
         Write-Log "`nCreating snapshot '$snapName'..." -ForegroundColor Green
         try {
-            $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $selectedID, "--db-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+            if ($target.IsAurora) {
+                $snapArgs = @("rds", "create-db-cluster-snapshot", "--db-cluster-identifier", $target.TargetId, "--db-cluster-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+            } else {
+                $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $target.TargetId, "--db-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+            }
             Invoke-AWS-WithRetry -Arguments $snapArgs | Out-Null
             Write-Log "Success! Snapshot creation initiated in background." -ForegroundColor Cyan
 
@@ -3343,12 +3404,33 @@ function New-MultipleRDSSnapshots-Interactive {
 
     # Prepare list for parallel processing
     $taskList = @()
+    $seenClusters = [System.Collections.Generic.HashSet[string]]::new()
+    $skippedDuplicates = @()
     foreach ($idx in $selectedIndices) {
         $inst = $instances[$idx]
-        $taskList += [PSCustomObject]@{
-            Identifier = $inst.DBInstanceIdentifier
-            SnapName = if (![string]::IsNullOrWhiteSpace($usrSuffix)) { "$defaultPrefix-$($inst.DBInstanceIdentifier)-$usrSuffix" } else { "$defaultPrefix-$($inst.DBInstanceIdentifier)" }
+        $isAuroraInst = (-not [string]::IsNullOrEmpty($inst.DBClusterIdentifier) -and $inst.Engine -like "aurora*")
+        if ($isAuroraInst -and -not $seenClusters.Add($inst.DBClusterIdentifier)) {
+            $skippedDuplicates += "$($inst.DBInstanceIdentifier) (same cluster: $($inst.DBClusterIdentifier))"
+            continue
         }
+        $snapId = if ($isAuroraInst) { $inst.DBClusterIdentifier } else { $inst.DBInstanceIdentifier }
+        $taskList += [PSCustomObject]@{
+            Identifier        = $inst.DBInstanceIdentifier
+            ClusterIdentifier = if ($isAuroraInst) { $inst.DBClusterIdentifier } else { $null }
+            IsAurora          = $isAuroraInst
+            SnapName          = if (![string]::IsNullOrWhiteSpace($usrSuffix)) { "$defaultPrefix-$snapId-$usrSuffix" } else { "$defaultPrefix-$snapId" }
+        }
+    }
+    if ($skippedDuplicates.Count -gt 0) {
+        Write-Host ""
+        Write-Host "NOTE: Skipped $($skippedDuplicates.Count) instance(s) sharing an Aurora Cluster already in the list:" -ForegroundColor Yellow
+        $skippedDuplicates | ForEach-Object { Write-Host "  - $_" -ForegroundColor DarkYellow }
+        Write-Host "(Aurora snapshots target the cluster, not individual instances.)" -ForegroundColor DarkGray
+    }
+    if ($taskList.Count -eq 0) {
+        Write-Host "No unique targets remaining after deduplication." -ForegroundColor Yellow
+        Read-Host "Press Enter to menu..."
+        return
     }
 
     # Pass profile to parallel scope
@@ -3367,7 +3449,11 @@ function New-MultipleRDSSnapshots-Interactive {
                 Write-Host "PowerShell 7+ required for parallel execution. Falling back to sequential." -ForegroundColor Yellow
                 foreach ($task in $currentTaskList) {
                     try {
-                        aws rds create-db-snapshot --db-instance-identifier $task.Identifier --db-snapshot-identifier $task.SnapName --profile $prof | Out-Null
+                        if ($task.IsAurora) {
+                            aws rds create-db-cluster-snapshot --db-cluster-identifier $task.ClusterIdentifier --db-cluster-snapshot-identifier $task.SnapName --profile $prof | Out-Null
+                        } else {
+                            aws rds create-db-snapshot --db-instance-identifier $task.Identifier --db-snapshot-identifier $task.SnapName --profile $prof | Out-Null
+                        }
                         $results += [PSCustomObject]@{ Id = $task.Identifier; Status = "OK"; Msg = "Snapshot Initiated" }
                         Write-Host "Snapshot initiated: $($task.Identifier)" -ForegroundColor Green
                     } catch {
@@ -3381,7 +3467,11 @@ function New-MultipleRDSSnapshots-Interactive {
                     $t = $_
                     $p = $using:prof
                     try {
-                        $output = aws rds create-db-snapshot --db-instance-identifier $t.Identifier --db-snapshot-identifier $t.SnapName --profile $p 2>&1
+                        if ($t.IsAurora) {
+                            $output = aws rds create-db-cluster-snapshot --db-cluster-identifier $t.ClusterIdentifier --db-cluster-snapshot-identifier $t.SnapName --profile $p 2>&1
+                        } else {
+                            $output = aws rds create-db-snapshot --db-instance-identifier $t.Identifier --db-snapshot-identifier $t.SnapName --profile $p 2>&1
+                        }
                         if ($LASTEXITCODE -ne 0) {
                             $errText = ($output | Out-String).Trim()
                             return [PSCustomObject]@{ Id = $t.Identifier; Status = "ERROR"; Msg = $errText }
@@ -3473,26 +3563,60 @@ function Remove-RDSSnapshot-Interactive {
     Write-Host "Fetching ALL manual snapshots (this may take a moment)..." -ForegroundColor Green
 
     try {
-        # Fetch ALL manual snapshots (no pagination limit)
+        # Fetch instance snapshots
         $snapArgs = @("rds", "describe-db-snapshots", "--snapshot-type", "manual", "--output", "json", "--profile", $global:AWSProfile)
         $snapOutput = Invoke-AWS-WithRetry -Arguments $snapArgs -ReturnJson
-        $json = $snapOutput -join ""
-        if ([string]::IsNullOrWhiteSpace($json)) {
+        $instSnaps = @()
+        $instJson = $snapOutput -join ""
+        if (-not [string]::IsNullOrWhiteSpace($instJson)) {
+            $instData = $instJson | ConvertFrom-Json
+            if ($instData.DBSnapshots) { $instSnaps = $instData.DBSnapshots }
+        }
+
+        # Fetch Aurora cluster snapshots
+        $clusterSnapArgs = @("rds", "describe-db-cluster-snapshots", "--snapshot-type", "manual", "--output", "json", "--profile", $global:AWSProfile)
+        $clusterSnaps = @()
+        try {
+            $clusterOutput = Invoke-AWS-WithRetry -Arguments $clusterSnapArgs -ReturnJson
+            $clusterJson = $clusterOutput -join ""
+            if (-not [string]::IsNullOrWhiteSpace($clusterJson)) {
+                $clusterData = $clusterJson | ConvertFrom-Json
+                if ($clusterData.DBClusterSnapshots) { $clusterSnaps = $clusterData.DBClusterSnapshots }
+            }
+        } catch { Write-Log "Warning: Could not fetch cluster snapshots: $_" -ForegroundColor DarkGray }
+
+        # Normalize into unified list
+        $allSnaps = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($s in $instSnaps) {
+            $allSnaps.Add([PSCustomObject]@{
+                DBSnapshotIdentifier = $s.DBSnapshotIdentifier
+                SourceIdentifier     = $s.DBInstanceIdentifier
+                SnapshotCreateTime   = $s.SnapshotCreateTime
+                AllocatedStorage     = $s.AllocatedStorage
+                Status               = $s.Status
+                SnapshotKind         = 'instance'
+                Label                = "[RDS]    $($s.DBSnapshotIdentifier)"
+            })
+        }
+        foreach ($s in $clusterSnaps) {
+            $allSnaps.Add([PSCustomObject]@{
+                DBSnapshotIdentifier = $s.DBClusterSnapshotIdentifier
+                SourceIdentifier     = $s.DBClusterIdentifier
+                SnapshotCreateTime   = $s.SnapshotCreateTime
+                AllocatedStorage     = $s.AllocatedStorage
+                Status               = $s.Status
+                SnapshotKind         = 'cluster'
+                Label                = "[AURORA] $($s.DBClusterSnapshotIdentifier)"
+            })
+        }
+
+        $snaps = @($allSnaps | Sort-Object SnapshotCreateTime -Descending)
+
+        if ($snaps.Count -eq 0) {
             Write-Host "No snapshots found." -ForegroundColor Yellow
             Read-Host "Press Enter to menu..."
             return
         }
-        $data = $json | ConvertFrom-Json
-        $snaps = $data.DBSnapshots
-
-        if (!$snaps) {
-            Write-Host "No snapshots found." -ForegroundColor Yellow
-            Read-Host "Press Enter to menu..."
-            return
-        }
-
-        # Sort by creation time descending
-        $snaps = $snaps | Sort-Object SnapshotCreateTime -Descending
 
         # Define headers for Viewport Engine
         $header = {
@@ -3548,7 +3672,11 @@ function Remove-RDSSnapshot-Interactive {
                 $s = $snaps[$idx]
                 Write-Host "Deleting '$($s.DBSnapshotIdentifier)'..." -ForegroundColor Yellow
                 try {
-                    $delSnapArgs = @("rds", "delete-db-snapshot", "--db-snapshot-identifier", $s.DBSnapshotIdentifier, "--profile", $global:AWSProfile)
+                    if ($s.SnapshotKind -eq 'cluster') {
+                        $delSnapArgs = @("rds", "delete-db-cluster-snapshot", "--db-cluster-snapshot-identifier", $s.DBSnapshotIdentifier, "--profile", $global:AWSProfile)
+                    } else {
+                        $delSnapArgs = @("rds", "delete-db-snapshot", "--db-snapshot-identifier", $s.DBSnapshotIdentifier, "--profile", $global:AWSProfile)
+                    }
                     Invoke-AWS-WithRetry -Arguments $delSnapArgs | Out-Null
                     Write-Host "Deleted." -ForegroundColor Green
                 } catch {
@@ -3582,27 +3710,59 @@ function Monitor-Snapshot-Progress {
 
         try {
             $snaps = @()
-            
+
             # General monitoring: Last 10 freshest snapshots (filtered by last 10 days)
             $TenDaysAgo = (Get-Date).AddDays(-10).ToString("yyyy-MM-dd")
 
-            # Query: Filter snapshots (creating/backing-up OR >= 10 days ago).
-            # Sort by SnapshotCreateTime (treating null as future '9999-12-31') so they appear at end of list, then take last 10.
+            # Instance snapshots
             $query = "DBSnapshots[?Status=='creating' || Status=='backing-up' || SnapshotCreateTime >= '$TenDaysAgo'] | sort_by(@, &SnapshotCreateTime || '9999-12-31')[-10:]"
-
             $snapMonArgs = @("rds", "describe-db-snapshots", "--query", $query, "--output", "json", "--profile", $global:AWSProfile)
             $snapMonOutput = Invoke-AWS-WithRetry -Arguments $snapMonArgs -ReturnJson
             $json = $snapMonOutput -join ""
-
             if (![string]::IsNullOrWhiteSpace($json)) {
-                # When using --query with a slice, output is a JSON array.
                 $rawSnaps = $json | ConvertFrom-Json
-                if ($rawSnaps -is [Array]) {
-                    $snaps = $rawSnaps
-                } elseif ($rawSnaps) {
-                    $snaps = @($rawSnaps)
+                $instSnaps = if ($rawSnaps -is [Array]) { $rawSnaps } elseif ($rawSnaps) { @($rawSnaps) } else { @() }
+                $snaps += $instSnaps | ForEach-Object {
+                    [PSCustomObject]@{
+                        DBSnapshotIdentifier = $_.DBSnapshotIdentifier
+                        DBInstanceIdentifier = $_.DBInstanceIdentifier
+                        Engine               = $_.Engine
+                        EngineVersion        = $_.EngineVersion
+                        Status               = $_.Status
+                        PercentProgress      = $_.PercentProgress
+                        AllocatedStorage     = $_.AllocatedStorage
+                        SnapshotCreateTime   = $_.SnapshotCreateTime
+                        SnapshotKind         = 'instance'
+                    }
                 }
             }
+
+            # Aurora cluster snapshots
+            $clusterQuery = "DBClusterSnapshots[?Status=='creating' || Status=='backing-up' || SnapshotCreateTime >= '$TenDaysAgo'] | sort_by(@, &SnapshotCreateTime || '9999-12-31')[-10:]"
+            try {
+                $clusterMonArgs = @("rds", "describe-db-cluster-snapshots", "--query", $clusterQuery, "--output", "json", "--profile", $global:AWSProfile)
+                $clusterOutput = Invoke-AWS-WithRetry -Arguments $clusterMonArgs -ReturnJson
+                $clusterJson = $clusterOutput -join ""
+                if (![string]::IsNullOrWhiteSpace($clusterJson)) {
+                    $rawCluster = $clusterJson | ConvertFrom-Json
+                    $clusterSnaps = if ($rawCluster -is [Array]) { $rawCluster } elseif ($rawCluster) { @($rawCluster) } else { @() }
+                    $snaps += $clusterSnaps | ForEach-Object {
+                        [PSCustomObject]@{
+                            DBSnapshotIdentifier = $_.DBClusterSnapshotIdentifier
+                            DBInstanceIdentifier = $_.DBClusterIdentifier
+                            Engine               = $_.Engine
+                            EngineVersion        = $_.EngineVersion
+                            Status               = $_.Status
+                            PercentProgress      = $_.PercentProgress
+                            AllocatedStorage     = $_.AllocatedStorage
+                            SnapshotCreateTime   = $_.SnapshotCreateTime
+                            SnapshotKind         = 'cluster'
+                        }
+                    }
+                }
+            } catch { }
+            # Keep only the 10 most recent across both types
+            $snaps = @($snaps | Sort-Object SnapshotCreateTime | Select-Object -Last 10)
 
             # Move cursor to top to avoid flicker
             try { [Console]::SetCursorPosition(0, 0) } catch {}
@@ -4574,8 +4734,15 @@ function Start-PostSwitchoverCleanup {
             $snapName = "final-pre-cleanup-$OldSourceId-$(Get-TimeStamp)"
             Write-Host "Creating final snapshot: $snapName" -ForegroundColor Cyan
 
+            $oldTarget = Resolve-SnapshotTarget -Instance $OldSourceId
+            Write-Host "(Target: $($oldTarget.Label))" -ForegroundColor DarkGray
+
             try {
-                $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $OldSourceId, "--db-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+                if ($oldTarget.IsAurora) {
+                    $snapArgs = @("rds", "create-db-cluster-snapshot", "--db-cluster-identifier", $oldTarget.TargetId, "--db-cluster-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+                } else {
+                    $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $oldTarget.TargetId, "--db-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+                }
                 Invoke-AWS-WithRetry -Arguments $snapArgs | Out-Null
                 Write-Host "Snapshot creation initiated." -ForegroundColor Green
             } catch {
@@ -4590,20 +4757,28 @@ function Start-PostSwitchoverCleanup {
 
             if ($deleteConfirm -eq "DELETE") {
                 try {
-                    # Disable deletion protection if enabled
-                    $modArgs = @("rds", "modify-db-instance", "--db-instance-identifier", $OldSourceId, "--no-deletion-protection", "--apply-immediately", "--output", "json", "--profile", $global:AWSProfile)
+                    if ($oldTarget.IsAurora) {
+                        $modArgs = @("rds", "modify-db-cluster", "--db-cluster-identifier", $oldTarget.TargetId, "--no-deletion-protection", "--apply-immediately", "--output", "json", "--profile", $global:AWSProfile)
+                    } else {
+                        $modArgs = @("rds", "modify-db-instance", "--db-instance-identifier", $OldSourceId, "--no-deletion-protection", "--apply-immediately", "--output", "json", "--profile", $global:AWSProfile)
+                    }
                     Invoke-AWS-WithRetry -Arguments $modArgs -ReturnJson | Out-Null
                 } catch {
                     Write-Host "Warning: Could not disable deletion protection: $_" -ForegroundColor Yellow
                 }
 
                 try {
-                    $delArgs = @("rds", "delete-db-instance", "--db-instance-identifier", $OldSourceId, "--skip-final-snapshot", "--profile", $global:AWSProfile)
+                    if ($oldTarget.IsAurora) {
+                        $delArgs = @("rds", "delete-db-cluster", "--db-cluster-identifier", $oldTarget.TargetId, "--skip-final-snapshot", "--profile", $global:AWSProfile)
+                        Write-Host "Deleting Aurora Cluster: $($oldTarget.TargetId)" -ForegroundColor Yellow
+                    } else {
+                        $delArgs = @("rds", "delete-db-instance", "--db-instance-identifier", $OldSourceId, "--skip-final-snapshot", "--profile", $global:AWSProfile)
+                    }
                     Invoke-AWS-WithRetry -Arguments $delArgs | Out-Null
-                    Write-Host "Instance deletion initiated." -ForegroundColor Green
+                    Write-Host "Deletion initiated." -ForegroundColor Green
                     $global:RDSInstancesCache = $null
                 } catch {
-                    Write-Host "Failed to delete instance: $_" -ForegroundColor Red
+                    Write-Host "Failed to delete: $_" -ForegroundColor Red
                 }
             } else {
                 Write-Host "Instance deletion skipped. You can delete it manually later." -ForegroundColor Yellow
@@ -4968,7 +5143,12 @@ function Update-OperatingSystem {
                 Write-Host "Creating snapshot '$snapName'..." -ForegroundColor Yellow
 
                 try {
-                    $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $item.InstanceID, "--db-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+                    $snapTarget = Resolve-SnapshotTarget -Instance $item.InstanceID
+                    if ($snapTarget.IsAurora) {
+                        $snapArgs = @("rds", "create-db-cluster-snapshot", "--db-cluster-identifier", $snapTarget.TargetId, "--db-cluster-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+                    } else {
+                        $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $snapTarget.TargetId, "--db-snapshot-identifier", $snapName, "--profile", $global:AWSProfile)
+                    }
                     Invoke-AWS-WithRetry -Arguments $snapArgs | Out-Null
                     Write-Host "Snapshot initiated." -ForegroundColor Green
                 } catch {
@@ -5533,9 +5713,14 @@ function Upgrade-Database-Interactive {
         }
 
         if ($snapChoice -eq "y") {
-            Write-Host "Creating snapshot '$defaultSnapName'..." -ForegroundColor Green
+            $upgradeTarget = Resolve-SnapshotTarget -Instance $instance
+            Write-Host "Creating snapshot '$defaultSnapName' ($($upgradeTarget.Label))..." -ForegroundColor Green
             try {
-                $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $instance.DBInstanceIdentifier, "--db-snapshot-identifier", $defaultSnapName, "--profile", $global:AWSProfile)
+                if ($upgradeTarget.IsAurora) {
+                    $snapArgs = @("rds", "create-db-cluster-snapshot", "--db-cluster-identifier", $upgradeTarget.TargetId, "--db-cluster-snapshot-identifier", $defaultSnapName, "--profile", $global:AWSProfile)
+                } else {
+                    $snapArgs = @("rds", "create-db-snapshot", "--db-instance-identifier", $upgradeTarget.TargetId, "--db-snapshot-identifier", $defaultSnapName, "--profile", $global:AWSProfile)
+                }
                 Invoke-AWS-WithRetry -Arguments $snapArgs | Out-Null
                 Write-Host "Snapshot creation initiated successfully." -ForegroundColor Green
             } catch {
@@ -5553,9 +5738,13 @@ function Upgrade-Database-Interactive {
         
         if ($confirm -eq "UPGRADE") {
             Write-Host "Initiating modification..." -ForegroundColor Green
-            
-            $argsList = @("rds", "modify-db-instance", "--db-instance-identifier", $instance.DBInstanceIdentifier, "--engine-version", $targetVer, "--output", "json", "--profile", $global:AWSProfile)
-            
+
+            if ($upgradeTarget.IsAurora) {
+                $argsList = @("rds", "modify-db-cluster", "--db-cluster-identifier", $upgradeTarget.TargetId, "--engine-version", $targetVer, "--output", "json", "--profile", $global:AWSProfile)
+            } else {
+                $argsList = @("rds", "modify-db-instance", "--db-instance-identifier", $instance.DBInstanceIdentifier, "--engine-version", $targetVer, "--output", "json", "--profile", $global:AWSProfile)
+            }
+
             if ($applyNow -eq 'y') {
                 $argsList += "--apply-immediately"
             }
@@ -5567,7 +5756,8 @@ function Upgrade-Database-Interactive {
                 $output = Invoke-AWS-WithRetry -Arguments $argsList -ReturnJson
                 $res = ($output -join "") | ConvertFrom-Json
                 Write-Host "Upgrade initiated successfully!" -ForegroundColor Cyan
-                Write-Host "Status: $($res.DBInstance.DBInstanceStatus)" -ForegroundColor Gray
+                $status = if ($upgradeTarget.IsAurora) { $res.DBCluster.Status } else { $res.DBInstance.DBInstanceStatus }
+                Write-Host "Status: $status" -ForegroundColor Gray
             } catch {
                 Write-Host "Upgrade failed: $_" -ForegroundColor Red
             }
