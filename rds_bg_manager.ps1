@@ -1,4 +1,4 @@
-# VERSION: 2026.06.19.01
+# VERSION: 2026.07.08.01
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,11 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-07-08
+    - FEATURE: Post-switchover "Zatrzymac stary Blue?" prompt now defaults to Yes — Enter stops the old Blue instance, type 'n' to skip. Forces apps still pointed at the old endpoint to fail over to the new one.
+    - FEATURE: `New-BGDeployment-Interactive` asks for a task number before naming the deployment; if given, it's appended to the default name (`bg-deployment-<source>-<task>`). Remembered for the session in `$global:LastBGTaskNr` — next deployment offers Enter-to-reuse or 'x' to clear.
+    - BUGFIX: `Invoke-SSOLogin` only auto-opened the browser for `*.awsapps.com` URLs; newer `aws sso login` OIDC flows use `oidc.<region>.amazonaws.com`, which was rejected and printed a redundant "Unexpected SSO URL" warning instead of opening the browser. Domain check now also accepts `*.amazonaws.com`.
+
     2026-06-17
     - FEATURE: Tag Management (`Set-RDSMonitoringTag-Interactive`) — multi-select RDS instances and toggle SSG-MONITORING tag (ENABLE/DISABLE). Instances without the tag are skipped with a message (tag is never created from scratch).
     - FEATURE: `Invoke-MonitoringTagToggle` — inline helper to toggle SSG-MONITORING on a single instance; used by keyboard shortcut M in upgrade/BG flows.
@@ -651,10 +656,16 @@ function Get-ProfileColor {
 }
 
 function global:Get-Header-Lines {
+    param(
+        [int]$Width = 0
+    )
+    if ($Width -le 0) {
+        try { $Width = $Host.UI.RawUI.WindowSize.Width } catch { $Width = 120 }
+    }
     $lines = @()
 
-    $lines += Pad-Line (Get-AnsiString "==========================================" -Color Cyan)
-    $lines += Pad-Line (Get-AnsiString "   AWS RDS BLUE/GREEN DEPLOYMENT TOOL     " -Color Cyan)
+    $lines += Pad-Line (Get-AnsiString "==========================================" -Color Cyan) $Width
+    $lines += Pad-Line (Get-AnsiString "   AWS RDS BLUE/GREEN DEPLOYMENT TOOL     " -Color Cyan) $Width
 
     if ($global:AWSProfile) {
         $profileStr = "   PROFILE: $global:AWSProfile (SSO)"
@@ -686,12 +697,12 @@ function global:Get-Header-Lines {
         } else {
             $line = Get-AnsiString $profileStr -Color Magenta
         }
-        $lines += Pad-Line $line
+        $lines += Pad-Line $line $Width
     }
     if ($global:SelectedInstance) {
-        $lines += Pad-Line (Get-AnsiString "   ACTIVE INSTANCE: $($global:SelectedInstance.DBInstanceIdentifier)" -Color Green)
+        $lines += Pad-Line (Get-AnsiString "   ACTIVE INSTANCE: $($global:SelectedInstance.DBInstanceIdentifier)" -Color Green) $Width
     }
-    $lines += Pad-Line (Get-AnsiString "==========================================" -Color Cyan)
+    $lines += Pad-Line (Get-AnsiString "==========================================" -Color Cyan) $Width
 
     return $lines
 }
@@ -1037,20 +1048,9 @@ function global:Invoke-InteractiveViewportSelection {
 function Select-RDSInstance-Live {
     # Wrapper for legacy/specific calls using the new engine
     param (
-        [array]$Instances, # Not used if we fetch from cache inside? No, passed by val.
-        # We need to ignore passed $Instances if we want live refresh in loop,
-        # or caller loops.
-        # The pattern: this function is called once.
-        # To support F5 refresh, we must loop here and refetch if needed.
-        # But $Instances is a param.
-        # If we want cache usage, we should fetch inside if null?
-        # User refactor request implied using Get-CachedRDSInstances.
+        [array]$Instances, # Used only for the first render; F5 refresh always re-fetches via Get-CachedRDSInstances -Force
         [string]$Title = "Select Instance"
     )
-
-    # Initial fetch if passed $Instances is null or we want to use cache primarily?
-    # The caller usually passes Get-RDSInstances.
-    # We will override $Instances with cache if we are in the loop.
 
     $currentItems = if ($Instances) { $Instances } else { Get-CachedRDSInstances }
     if (!$currentItems) { return $null }
@@ -1059,7 +1059,7 @@ function Select-RDSInstance-Live {
         param($SearchString, $TotalItems, $FilteredCount)
         $lines = @(Get-Header-Lines)
         $lines += Get-AnsiString "$Title" -Color Cyan
-        $lines += Get-AnsiString "Search filter: $SearchString_" -Color Yellow
+        $lines += Get-AnsiString "Search filter: $SearchString" -Color Yellow
         $lines += Get-AnsiString "Showing $FilteredCount / $TotalItems items" -Color DarkGray
         $lines += Get-AnsiString "--------------------------------------------------" -Color DarkGray
         return $lines
@@ -1102,8 +1102,8 @@ function Invoke-SSOLogin {
         Write-Host $_
         if (-not $urlOpened -and "$_" -match "(https://\S+)") {
             $url = $matches[1].TrimEnd('.')
-            Write-Log "Opening browser: $url" -ForegroundColor Cyan
-            if ($url -match '^https://[a-zA-Z0-9\-]+\.awsapps\.com/') {
+            if ($url -match '^https://[a-zA-Z0-9.\-]+\.(awsapps\.com|amazonaws\.com)(/|$)') {
+                Write-Log "Opening browser: $url" -ForegroundColor Cyan
                 Start-Process $url
             } else {
                 Write-Log "Unexpected SSO URL — not opening browser: $url" -ForegroundColor Red
@@ -1333,7 +1333,7 @@ function Select-Client-Session {
 
     if ($idx -eq ($options.Count - 1)) { return $null } # Show All
     if ($idx -lt 0) { exit } # Cancel (ESC at root = exit)
-    if ($idx -ge $sessions.Count) { continue }
+    if ($idx -ge $sessions.Count) { return $null } # Separator row selected, treat as cancel
 
     $selectedSession = $sessions[$idx]
     return @{
@@ -1432,6 +1432,7 @@ function Select-AWSProfile {
     } else {
         $global:AWSProfile = $selectedItem.Value
     }
+    $script:ManualSnapshotQuotaFetched = $false # Quota is per-account; re-fetch after switching profile
 
     # Update Window Title
     # Format: Client | Profile - Role
@@ -1530,7 +1531,7 @@ function Export-Report {
 <thead><tr>
 "@)
                 foreach ($prop in $properties) {
-                    [void]$htmlSb.AppendLine("  <th>$([System.Web.HttpUtility]::HtmlEncode($prop))</th>")
+                    [void]$htmlSb.AppendLine("  <th>$([System.Net.WebUtility]::HtmlEncode($prop))</th>")
                 }
                 [void]$htmlSb.AppendLine("</tr></thead>")
                 [void]$htmlSb.AppendLine("<tbody>")
@@ -1540,7 +1541,7 @@ function Export-Report {
                     foreach ($prop in $properties) {
                         $val = $row.$prop
                         if ($val -eq $null) { $val = "" }
-                        [void]$htmlSb.Append("<td>$([System.Web.HttpUtility]::HtmlEncode([string]$val))</td>")
+                        [void]$htmlSb.Append("<td>$([System.Net.WebUtility]::HtmlEncode([string]$val))</td>")
                     }
                     [void]$htmlSb.AppendLine("</tr>")
                 }
@@ -1818,49 +1819,66 @@ function Remove-EC2Snapshot-Interactive {
     Read-Host "Press Enter to menu..."
 }
 
-function Get-RDSCloudWatchMetrics {
-    param([string]$InstanceId)
-    $result = @{ CPU = $null; Connections = $null }
-    if ([string]::IsNullOrWhiteSpace($InstanceId)) { return $result }
+function Get-RDSCloudWatchMetricsBatch {
+    <#
+    .DESCRIPTION
+    Same CPU/Connections lookup as Get-RDSCloudWatchMetrics, but for all instances in a single
+    cloudwatch get-metric-data call instead of 2 AWS CLI calls per instance. Used by the live
+    monitor, which re-fetches on every refresh cycle.
+    #>
+    param([string[]]$InstanceIds)
+    $result = @{}
+    foreach ($id in $InstanceIds) { $result[$id] = @{ CPU = $null; Connections = $null } }
+    if (-not $InstanceIds -or $InstanceIds.Count -eq 0) { return $result }
+
     try {
         $end   = (Get-Date).ToUniversalTime()
         $start = $end.AddMinutes(-10)
         $startStr = $start.ToString("yyyy-MM-ddTHH:mm:ssZ")
         $endStr   = $end.ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-        $cpuArgs = @(
-            "cloudwatch", "get-metric-statistics",
-            "--namespace", "AWS/RDS",
-            "--metric-name", "CPUUtilization",
-            "--dimensions", "Name=DBInstanceIdentifier,Value=$InstanceId",
-            "--start-time", $startStr, "--end-time", $endStr,
-            "--period", "300", "--statistics", "Average",
-            "--output", "json", "--profile", $global:AWSProfile
-        )
-        $json = (Invoke-AWS-WithRetry -Arguments $cpuArgs -ReturnJson) -join ""
-        if (![string]::IsNullOrWhiteSpace($json)) {
-            $data = $json | ConvertFrom-Json
-            if ($data.Datapoints -and $data.Datapoints.Count -gt 0) {
-                $val = ($data.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1).Average
-                $result.CPU = [math]::Round($val, 0)
+        $queries = @()
+        for ($i = 0; $i -lt $InstanceIds.Count; $i++) {
+            $iid = $InstanceIds[$i]
+            $dims = @(@{ Name = "DBInstanceIdentifier"; Value = $iid })
+            $queries += @{
+                Id = "cpu$i"
+                MetricStat = @{
+                    Metric = @{ Namespace = "AWS/RDS"; MetricName = "CPUUtilization"; Dimensions = $dims }
+                    Period = 300
+                    Stat = "Average"
+                }
+                ReturnData = $true
+            }
+            $queries += @{
+                Id = "conn$i"
+                MetricStat = @{
+                    Metric = @{ Namespace = "AWS/RDS"; MetricName = "DatabaseConnections"; Dimensions = $dims }
+                    Period = 300
+                    Stat = "Average"
+                }
+                ReturnData = $true
             }
         }
 
-        $connArgs = @(
-            "cloudwatch", "get-metric-statistics",
-            "--namespace", "AWS/RDS",
-            "--metric-name", "DatabaseConnections",
-            "--dimensions", "Name=DBInstanceIdentifier,Value=$InstanceId",
+        $queryJson = ($queries | ConvertTo-Json -Depth 6 -Compress)
+        $args = @(
+            "cloudwatch", "get-metric-data",
             "--start-time", $startStr, "--end-time", $endStr,
-            "--period", "300", "--statistics", "Average",
+            "--metric-data-queries", $queryJson,
             "--output", "json", "--profile", $global:AWSProfile
         )
-        $json2 = (Invoke-AWS-WithRetry -Arguments $connArgs -ReturnJson) -join ""
-        if (![string]::IsNullOrWhiteSpace($json2)) {
-            $data2 = $json2 | ConvertFrom-Json
-            if ($data2.Datapoints -and $data2.Datapoints.Count -gt 0) {
-                $val2 = ($data2.Datapoints | Sort-Object Timestamp -Descending | Select-Object -First 1).Average
-                $result.Connections = [math]::Round($val2, 0)
+        $json = (Invoke-AWS-WithRetry -Arguments $args -ReturnJson) -join ""
+        if (![string]::IsNullOrWhiteSpace($json)) {
+            $data = $json | ConvertFrom-Json
+            foreach ($r in $data.MetricDataResults) {
+                if (!$r.Values -or $r.Values.Count -eq 0) { continue }
+                $val = [math]::Round([double]$r.Values[0], 0) # results are TimestampDescending by default -> latest first
+                if ($r.Id -match '^cpu(\d+)$') {
+                    $result[$InstanceIds[[int]$Matches[1]]].CPU = $val
+                } elseif ($r.Id -match '^conn(\d+)$') {
+                    $result[$InstanceIds[[int]$Matches[1]]].Connections = $val
+                }
             }
         }
     } catch {}
@@ -1879,12 +1897,10 @@ function Monitor-RDS-State {
     while ($true) {
         $instances = Get-CachedRDSInstances
 
-        # Fetch CloudWatch metrics once per outer refresh cycle
+        # Fetch CloudWatch metrics once per outer refresh cycle (single batched API call for all instances)
         $cwMetrics = @{}
         if ($instances) {
-            foreach ($inst in $instances) {
-                $cwMetrics[$inst.DBInstanceIdentifier] = Get-RDSCloudWatchMetrics -InstanceId $inst.DBInstanceIdentifier
-            }
+            $cwMetrics = Get-RDSCloudWatchMetricsBatch -InstanceIds @($instances.DBInstanceIdentifier)
         }
 
         # Apply filter
@@ -1896,7 +1912,7 @@ function Monitor-RDS-State {
         # Calculate pagination
         try { $winHeight = $Host.UI.RawUI.WindowSize.Height } catch { $winHeight = 30 }
         try { $winWidth = $Host.UI.RawUI.WindowSize.Width } catch { $winWidth = 120 }
-        $headerLines = Get-Header-Lines
+        $headerLines = Get-Header-Lines -Width $winWidth
         $reservedLines = $headerLines.Count + 6  # title + separator + column header + separator + footer + filter bar
         $pageSize = [math]::Max(5, $winHeight - $reservedLines)
         $totalItems = if ($filtered) { $filtered.Count } else { 0 }
@@ -2398,13 +2414,17 @@ function Get-ManualSnapshotCount {
 
         $total = [int]($instCount ?? 0) + [int]($clusterCount ?? 0)
 
-        # Refresh quota limit from Service Quotas (quota code L-272F1212 = Manual DB Snapshots)
-        try {
-            $quotaArgs = @("service-quotas", "get-service-quota", "--service-code", "rds", "--quota-code", "L-272F1212", "--query", "Quota.Value", "--output", "text", "--profile", $global:AWSProfile)
-            $quotaOut  = Invoke-AWS-WithRetry -Arguments $quotaArgs
-            $quotaVal  = ($quotaOut | Where-Object { $_ -match '^\d+(\.\d+)?$' } | Select-Object -First 1)
-            if ($quotaVal) { $script:MaxManualSnapshots = [int][double]$quotaVal }
-        } catch {}
+        # Refresh quota limit from Service Quotas (quota code L-272F1212 = Manual DB Snapshots).
+        # This rarely changes mid-session, unlike snapshot counts, so fetch it once per profile.
+        if (-not $script:ManualSnapshotQuotaFetched) {
+            try {
+                $quotaArgs = @("service-quotas", "get-service-quota", "--service-code", "rds", "--quota-code", "L-272F1212", "--query", "Quota.Value", "--output", "text", "--profile", $global:AWSProfile)
+                $quotaOut  = Invoke-AWS-WithRetry -Arguments $quotaArgs
+                $quotaVal  = ($quotaOut | Where-Object { $_ -match '^\d+(\.\d+)?$' } | Select-Object -First 1)
+                if ($quotaVal) { $script:MaxManualSnapshots = [int][double]$quotaVal }
+                $script:ManualSnapshotQuotaFetched = $true
+            } catch {}
+        }
 
         return $total
     } catch {
@@ -2760,46 +2780,69 @@ function Show-RDSEvents {
     Read-Host "Press Enter to menu..."
 }
 
+function Get-PendingMaintenanceFlat {
+    <#
+    .DESCRIPTION
+    Fetches describe-pending-maintenance-actions once and flattens it to one row per
+    (resource, action-detail) pair. Shared by Show-PendingMaintenance, Update-OperatingSystem,
+    and Apply-PendingMaintenance so they don't each re-fetch/re-parse the same account-wide call.
+    #>
+    $argsList = @("rds", "describe-pending-maintenance-actions", "--output", "json", "--profile", $global:AWSProfile)
+    $output = Invoke-AWS-WithRetry -Arguments $argsList -ReturnJson
+    $json = $output -join ""
+    if ([string]::IsNullOrWhiteSpace($json)) { return @() }
+
+    $data = $json | ConvertFrom-Json
+    if (!$data.PendingMaintenanceActions) { return @() }
+
+    $flatList = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($p in $data.PendingMaintenanceActions) {
+        if (!$p.PendingMaintenanceActionDetails) { continue }
+        $id = Get-InstanceIdFromArn $p.ResourceIdentifier
+        foreach ($d in $p.PendingMaintenanceActionDetails) {
+            $flatList.Add([PSCustomObject]@{
+                ResourceArn = $p.ResourceIdentifier
+                InstanceID = $id
+                Action = $d.Action
+                Description = $d.Description
+                Status = if ($d.CurrentApplyDate) { "Scheduled" } else { "Available" }
+                AutoApplied = $d.AutoAppliedAfterDate
+            })
+        }
+    }
+    return $flatList
+}
+
 function Show-PendingMaintenance {
     Show-Header
     Write-Host "Fetching Pending Maintenance Actions..." -ForegroundColor Green
-    
+
     try {
-        $mntArgs = @("rds", "describe-pending-maintenance-actions", "--output", "json", "--profile", $global:AWSProfile)
-        $mntOutput = Invoke-AWS-WithRetry -Arguments $mntArgs -ReturnJson
-        $json = $mntOutput -join ""
-        if ([string]::IsNullOrWhiteSpace($json)) {
+        $flatList = Get-PendingMaintenanceFlat
+        if ($flatList.Count -eq 0) {
             Write-Host "No pending maintenance actions found." -ForegroundColor Yellow
         } else {
-            $data = $json | ConvertFrom-Json
-            if ($data.PendingMaintenanceActions) {
-                Write-Host ("{0,-30} {1,-20} {2}" -f "Instance ID", "Action", "Description")
-                Write-Host "---------------------------------------------------------------------------------------" -ForegroundColor Gray
-                
-                $exportData = [System.Collections.Generic.List[PSCustomObject]]::new()
-                foreach ($item in $data.PendingMaintenanceActions) {
-                    # Extract Instance ID from ARN
-                    $instanceId = Get-InstanceIdFromArn $item.ResourceIdentifier
-                    
-                    # Flatten details for export
-                    foreach ($detail in $item.PendingMaintenanceActionDetails) {
-                        Write-Host ("{0,-30} {1,-20} {2}" -f $instanceId, $detail.Action, $detail.Description)
-                    }
-                    $detailsText = $item.PendingMaintenanceActionDetails | ForEach-Object { "$($_.Action): $($_.Description)" }
-                    
-                    $exportData.Add([PSCustomObject]@{
-                        InstanceID = $instanceId
-                        ResourceIdentifier = $item.ResourceIdentifier
-                        Details = $detailsText -join "; "
-                    })
+            Write-Host ("{0,-30} {1,-20} {2}" -f "Instance ID", "Action", "Description")
+            Write-Host "---------------------------------------------------------------------------------------" -ForegroundColor Gray
+
+            $exportData = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($group in ($flatList | Group-Object ResourceArn)) {
+                $instanceId = $group.Group[0].InstanceID
+                foreach ($detail in $group.Group) {
+                    Write-Host ("{0,-30} {1,-20} {2}" -f $instanceId, $detail.Action, $detail.Description)
                 }
-                Write-Host "---------------------------------------------------------------------------------------"
-                
-                Export-Report -Data $exportData -DefaultFileName "PendingMaintenance"
-                return
-            } else {
-                Write-Host "No pending maintenance actions found." -ForegroundColor Yellow
+                $detailsText = $group.Group | ForEach-Object { "$($_.Action): $($_.Description)" }
+
+                $exportData.Add([PSCustomObject]@{
+                    InstanceID = $instanceId
+                    ResourceIdentifier = $group.Name
+                    Details = $detailsText -join "; "
+                })
             }
+            Write-Host "---------------------------------------------------------------------------------------"
+
+            Export-Report -Data $exportData -DefaultFileName "PendingMaintenance"
+            return
         }
     } catch {
         Write-Host "Error fetching maintenance info: $_" -ForegroundColor Red
@@ -3408,7 +3451,7 @@ function New-MultipleRDSSnapshots-Interactive {
     $skippedDuplicates = @()
     foreach ($idx in $selectedIndices) {
         $inst = $instances[$idx]
-        $isAuroraInst = (-not [string]::IsNullOrEmpty($inst.DBClusterIdentifier) -and $inst.Engine -like "aurora*")
+        $isAuroraInst = (Resolve-SnapshotTarget -Instance $inst).IsAurora
         if ($isAuroraInst -and -not $seenClusters.Add($inst.DBClusterIdentifier)) {
             $skippedDuplicates += "$($inst.DBInstanceIdentifier) (same cluster: $($inst.DBClusterIdentifier))"
             continue
@@ -3539,12 +3582,8 @@ function New-MultipleRDSSnapshots-Interactive {
                     $retrySnapshots = $true
 
                     # Re-check quota before retry
-                    $currentCount = Get-ManualSnapshotCount
-                    if (($currentCount + $currentTaskList.Count) -gt $script:MaxManualSnapshots) {
-                        Write-Host "WARNING: Quota still insufficient! $currentCount used + $($currentTaskList.Count) required > $($script:MaxManualSnapshots) limit." -ForegroundColor Red
-                        Write-Host "Please delete old snapshots first." -ForegroundColor Yellow
+                    if (-not (Confirm-SnapshotQuota -RequiredSlots $currentTaskList.Count)) {
                         $retrySnapshots = $false
-                        Read-Host "Press Enter to menu..."
                         return
                     }
                 }
@@ -4081,6 +4120,22 @@ function New-BGDeployment-Interactive {
     # 4. BG Deployment Name & Green DB Name
     $defaultBGName = "bg-deployment-$sourceDB"
 
+    Write-Host "`n[Task Reference]" -ForegroundColor Cyan
+    if ($global:LastBGTaskNr) {
+        $taskNr = Read-Host "Nr taska [Enter = '$global:LastBGTaskNr', 'x' aby wyczyscic]"
+        if ([string]::IsNullOrWhiteSpace($taskNr)) {
+            $taskNr = $global:LastBGTaskNr
+        } elseif ($taskNr -eq 'x') {
+            $taskNr = ""
+        }
+    } else {
+        $taskNr = Read-Host "Nr taska ['Enter' aby pominac]"
+    }
+    $global:LastBGTaskNr = if ([string]::IsNullOrWhiteSpace($taskNr)) { $null } else { $taskNr.Trim() }
+    if ($global:LastBGTaskNr) {
+        $defaultBGName = "$defaultBGName-$($global:LastBGTaskNr)"
+    }
+
     Write-Host "`n[Deployment Naming]" -ForegroundColor Cyan
     Write-Host "Enter BG Deploy Name ['q' to quit]: " -NoNewline -ForegroundColor Cyan
     [System.Console]::Write($defaultBGName)
@@ -4280,7 +4335,7 @@ function Monitor-BGStatus-Interactive {
         [void]$sb.Clear()
 
         # Header
-        $headerLines = Get-Header-Lines
+        $headerLines = Get-Header-Lines -Width $winWidth
         foreach ($hl in $headerLines) {
             [void]$sb.AppendLine((Pad-Line $hl $winWidth))
         }
@@ -4577,8 +4632,7 @@ function Remove-BGDeployment-Interactive {
         Write-Host "Instance:   None selected (Instances will remain)" -ForegroundColor Green
     }
 
-    $confirmPhrase = Read-Host "`nType 'DELETE ME' to confirm execution"
-    if ($confirmPhrase -ne "DELETE ME") {
+    if (-not (Confirm-DestructivePhrase -Prompt "`nType 'DELETE ME' to confirm execution" -Phrase "DELETE ME")) {
         Write-Host "Operation Cancelled." -ForegroundColor Yellow
         Read-Host "Press Enter to menu..."
         return
@@ -4753,9 +4807,7 @@ function Start-PostSwitchoverCleanup {
             }
 
             Write-Host ""
-            $deleteConfirm = Read-Host "Type 'DELETE' to delete old source instance '$OldSourceId' (or anything else to skip)"
-
-            if ($deleteConfirm -eq "DELETE") {
+            if (Confirm-DestructivePhrase -Prompt "Type 'DELETE' to delete old source instance '$OldSourceId' (or anything else to skip)" -Phrase "DELETE") {
                 try {
                     if ($oldTarget.IsAurora) {
                         $modArgs = @("rds", "modify-db-cluster", "--db-cluster-identifier", $oldTarget.TargetId, "--no-deletion-protection", "--apply-immediately", "--output", "json", "--profile", $global:AWSProfile)
@@ -5035,8 +5087,8 @@ function Invoke-Switchover-Interactive {
 
             # Ask about stopping old Blue
             Write-Host ""
-            $stopOld = Read-Host "Zatrzymac stary Blue '$oldBlueId'? (y/N)"
-            if ($stopOld -eq 'y') {
+            $stopOld = Read-Host "Zatrzymac stary Blue '$oldBlueId'? (Y/n)"
+            if ($stopOld.ToLower() -ne 'n') {
                 try {
                     $stopArgs = @("rds", "stop-db-instance", "--db-instance-identifier", $oldBlueId, "--profile", $global:AWSProfile)
                     Invoke-AWS-WithRetry -Arguments $stopArgs | Out-Null
@@ -5070,40 +5122,8 @@ function Update-OperatingSystem {
 
     # To zajmuje wieki / This takes ages
     try {
-        $argsList = @("rds", "describe-pending-maintenance-actions", "--output", "json", "--profile", $global:AWSProfile)
-        $output = Invoke-AWS-WithRetry -Arguments $argsList -ReturnJson
-        $json = $output -join ""
-
-        if ([string]::IsNullOrWhiteSpace($json)) {
-            Write-Host "No pending maintenance actions found." -ForegroundColor Yellow
-            Read-Host "Press Enter to menu..."
-            return
-        }
-
-        $data = $json | ConvertFrom-Json
-
-        # Filter for system-update
-        $pendingOS = @()
-        if ($data.PendingMaintenanceActions) {
-            foreach ($p in $data.PendingMaintenanceActions) {
-                if ($p.PendingMaintenanceActionDetails) {
-                    $osActions = $p.PendingMaintenanceActionDetails | Where-Object { $_.Action -eq 'system-update' }
-                    if ($osActions) {
-                        # Add to list
-                        $id = Get-InstanceIdFromArn $p.ResourceIdentifier
-
-                        foreach ($a in $osActions) {
-                            $pendingOS += [PSCustomObject]@{
-                                ResourceArn = $p.ResourceIdentifier
-                                InstanceID = $id
-                                Action = $a.Action
-                                Description = $a.Description
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        $flatList = Get-PendingMaintenanceFlat
+        $pendingOS = @($flatList | Where-Object { $_.Action -eq 'system-update' })
 
         if (!$pendingOS -or $pendingOS.Count -eq 0) {
             Write-Host "No pending OS upgrades found." -ForegroundColor Yellow
@@ -5216,46 +5236,12 @@ function Apply-PendingMaintenance {
     Write-Host "Fetching Pending Maintenance Actions..." -ForegroundColor Green
 
     try {
-        $argsList = @("rds", "describe-pending-maintenance-actions", "--output", "json", "--profile", $global:AWSProfile)
-        $output = Invoke-AWS-WithRetry -Arguments $argsList -ReturnJson
-        $json = $output -join ""
+        $flatList = Get-PendingMaintenanceFlat
 
-        if ([string]::IsNullOrWhiteSpace($json)) {
+        if (!$flatList -or $flatList.Count -eq 0) {
             Write-Host "No pending maintenance actions found." -ForegroundColor Yellow
             Read-Host "Press Enter to menu..."
             return
-        }
-
-        $data = $json | ConvertFrom-Json
-        # Filter for actual details
-        $pending = @()
-        if ($data.PendingMaintenanceActions) {
-            $pending = $data.PendingMaintenanceActions | Where-Object { $_.PendingMaintenanceActionDetails }
-        }
-
-        if (!$pending -or $pending.Count -eq 0) {
-            Write-Host "No pending maintenance actions found." -ForegroundColor Yellow
-            Read-Host "Press Enter to menu..."
-            return
-        }
-
-        # Flatten list for display
-        # We might have multiple actions per resource, but usually one block.
-        # Let's flatten: Resource -> Detail
-        $flatList = @()
-        foreach ($p in $pending) {
-            $id = Get-InstanceIdFromArn $p.ResourceIdentifier
-
-            foreach ($d in $p.PendingMaintenanceActionDetails) {
-                $flatList += [PSCustomObject]@{
-                    ResourceArn = $p.ResourceIdentifier
-                    InstanceID = $id
-                    Action = $d.Action
-                    Status = if ($d.CurrentApplyDate) { "Scheduled" } else { "Available" }
-                    Description = $d.Description
-                    AutoApplied = $d.AutoAppliedAfterDate
-                }
-            }
         }
 
         # Build options for Show-Menu
@@ -5315,41 +5301,69 @@ function Apply-PendingMaintenance {
     Read-Host "Press Enter to menu..."
 }
 
-function Remove-RDS-Interactive {
+function Confirm-DestructivePhrase {
+    <#
+    .DESCRIPTION
+    Prompts for a typed confirmation phrase before a destructive action. Shared by the
+    delete/stop/promote-style confirmations scattered across the script.
+    #>
+    param(
+        [string]$Prompt,
+        [string]$Phrase,
+        [switch]$CaseInsensitive
+    )
+    $resp = Read-Host $Prompt
+    if ($CaseInsensitive) { return ($resp.ToUpper() -eq $Phrase.ToUpper()) }
+    return ($resp -eq $Phrase)
+}
+
+function Select-MultipleInstances {
+    <#
+    .DESCRIPTION
+    Fetch → multi-select menu → handle -99 (restart)/-1 (cancel)/empty selection.
+    Shared by Remove-RDS-Interactive, Start-RDS-Interactive, Stop-RDS-Interactive so each
+    doesn't reimplement the same ~15-line fetch/select/guard block.
+    Returns the selected instance objects, or $null if the caller should just return.
+    #>
+    param([string]$Title)
     $instances = Get-RDSInstances
     if (!$instances) {
         Write-Host "No instances found." -ForegroundColor Yellow
         Read-Host "Press Enter to menu..."
-        return
+        return $null
     }
 
     $options = @($instances | ForEach-Object { "$($_.DBInstanceIdentifier) ($($_.DBInstanceStatus))" })
+    $selectedIndices = Show-Menu -Title $Title -Options $options -EnableFilter -MultiSelect
 
-    $selectedIndices = Show-Menu -Title "Select Instances to DELETE (SPACE to Select)" -Options $options -EnableFilter -MultiSelect
-
-    if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
-    if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
+    if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return $null }
+    if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return $null }
 
     if ($selectedIndices -eq $null -or $selectedIndices.Count -eq 0) {
         Write-Host "No instances selected." -ForegroundColor Yellow
         Read-Host "Press Enter to menu..."
-        return
+        return $null
     }
+
+    return @($selectedIndices | ForEach-Object { $instances[$_] })
+}
+
+function Remove-RDS-Interactive {
+    $selected = Select-MultipleInstances -Title "Select Instances to DELETE (SPACE to Select)"
+    if (!$selected) { return }
 
     Show-Header
     Write-Host "INSTANCES TO DELETE:" -ForegroundColor Red
-    foreach ($idx in $selectedIndices) {
-        Write-Host " - $($instances[$idx].DBInstanceIdentifier)" -ForegroundColor Red
+    foreach ($inst in $selected) {
+        Write-Host " - $($inst.DBInstanceIdentifier)" -ForegroundColor Red
     }
 
-    $confirm = Read-Host "Type 'DELETE' to confirm DESTRUCTION of these instances"
-    if ($confirm -eq "DELETE") {
+    if (Confirm-DestructivePhrase -Prompt "Type 'DELETE' to confirm DESTRUCTION of these instances" -Phrase "DELETE") {
 
         $snapChoice = Read-Host "Create Final Snapshot? [Y=Yes (Default) / n=No]"
         if ([string]::IsNullOrWhiteSpace($snapChoice)) { $snapChoice = "y" }
 
-        foreach ($idx in $selectedIndices) {
-            $inst = $instances[$idx]
+        foreach ($inst in $selected) {
             $id = $inst.DBInstanceIdentifier
 
             # 1. Disable Deletion Protection
@@ -5394,28 +5408,10 @@ function Remove-RDS-Interactive {
 }
 
 function Start-RDS-Interactive {
-    $instances = Get-RDSInstances
-    if (!$instances) {
-        Write-Host "No instances found." -ForegroundColor Yellow
-        Read-Host "Press Enter to menu..."
-        return
-    }
+    $selected = Select-MultipleInstances -Title "Select Instances to START (SPACE to Select)"
+    if (!$selected) { return }
 
-    $options = @($instances | ForEach-Object { "$($_.DBInstanceIdentifier) ($($_.DBInstanceStatus))" })
-
-    $selectedIndices = Show-Menu -Title "Select Instances to START (SPACE to Select)" -Options $options -EnableFilter -MultiSelect
-
-    if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
-    if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
-
-    if ($selectedIndices -eq $null -or $selectedIndices.Count -eq 0) {
-        Write-Host "No instances selected." -ForegroundColor Yellow
-        Read-Host "Press Enter to menu..."
-        return
-    }
-
-    foreach ($idx in $selectedIndices) {
-        $inst = $instances[$idx]
+    foreach ($inst in $selected) {
         $id = $inst.DBInstanceIdentifier
 
         Write-Host "Starting '$id'..." -ForegroundColor Cyan
@@ -5432,36 +5428,17 @@ function Start-RDS-Interactive {
 }
 
 function Stop-RDS-Interactive {
-    $instances = Get-RDSInstances
-    if (!$instances) {
-        Write-Host "No instances found." -ForegroundColor Yellow
-        Read-Host "Press Enter to menu..."
-        return
-    }
-
-    $options = @($instances | ForEach-Object { "$($_.DBInstanceIdentifier) ($($_.DBInstanceStatus))" })
-
-    $selectedIndices = Show-Menu -Title "Select Instances to STOP (SPACE to Select)" -Options $options -EnableFilter -MultiSelect
-
-    if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true; return }
-    if ($selectedIndices -is [int] -and $selectedIndices -lt 0) { return }
-
-    if ($selectedIndices -eq $null -or $selectedIndices.Count -eq 0) {
-        Write-Host "No instances selected." -ForegroundColor Yellow
-        Read-Host "Press Enter to menu..."
-        return
-    }
+    $selected = Select-MultipleInstances -Title "Select Instances to STOP (SPACE to Select)"
+    if (!$selected) { return }
 
     Show-Header
     Write-Host "INSTANCES TO STOP:" -ForegroundColor Red
-    foreach ($idx in $selectedIndices) {
-        Write-Host " - $($instances[$idx].DBInstanceIdentifier)" -ForegroundColor Red
+    foreach ($inst in $selected) {
+        Write-Host " - $($inst.DBInstanceIdentifier)" -ForegroundColor Red
     }
 
-    $confirm = Read-Host "Type 'STOP' to confirm shutdown of these instances"
-    if ($confirm.ToUpper() -eq "STOP") {
-        foreach ($idx in $selectedIndices) {
-            $inst = $instances[$idx]
+    if (Confirm-DestructivePhrase -Prompt "Type 'STOP' to confirm shutdown of these instances" -Phrase "STOP" -CaseInsensitive) {
+        foreach ($inst in $selected) {
             $id = $inst.DBInstanceIdentifier
 
             Write-Host "Stopping '$id'..." -ForegroundColor Yellow
@@ -5712,8 +5689,9 @@ function Upgrade-Database-Interactive {
             $snapChoice = "y" # Proceed to create
         }
 
+        $upgradeTarget = Resolve-SnapshotTarget -Instance $instance
+
         if ($snapChoice -eq "y") {
-            $upgradeTarget = Resolve-SnapshotTarget -Instance $instance
             Write-Host "Creating snapshot '$defaultSnapName' ($($upgradeTarget.Label))..." -ForegroundColor Green
             try {
                 if ($upgradeTarget.IsAurora) {
