@@ -5241,6 +5241,14 @@ function Invoke-BatchSwitchoverStop-Interactive {
     # fixed guess — otherwise a deployment legitimately still finishing gets marked TIMED_OUT.
     $maxPolls = [math]::Max(40, [math]::Ceiling(([int]$timeout + 300) / 15))
 
+    # Clear the pre-check/confirmation screen so the kick-off + poll output below doesn't
+    # bleed into the leftover text still sitting on screen from the steps above.
+    Show-Header
+    Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║   BATCH SWITCHOVER + STOP OLD BLUE — RUNNING     ║" -ForegroundColor Cyan
+    Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+
     # --- Kick-off: fire all switchovers first (cheap API calls), poll them together below ---
     foreach ($c in $toRun) {
         try {
