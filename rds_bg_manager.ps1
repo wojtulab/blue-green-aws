@@ -2275,6 +2275,7 @@ function Show-RDS-Menu {
             "Upgrade Database Engine",
             "Update OS",
             "Execute Switchover",
+            "Batch Switchover + Stop Old Blue",
             "Apply Pending Maintenance",
             "------------------------------------------",
             "Tag Management (SSG-MONITORING)",
@@ -2304,9 +2305,10 @@ function Show-RDS-Menu {
             18 { Upgrade-Database-Interactive }
             19 { Update-OperatingSystem }
             20 { Invoke-Switchover-Interactive }
-            21 { Apply-PendingMaintenance }
-            23 { Set-RDSMonitoringTag-Interactive }
-            25 { return }
+            21 { Invoke-BatchSwitchoverStop-Interactive }
+            22 { Apply-PendingMaintenance }
+            24 { Set-RDSMonitoringTag-Interactive }
+            26 { return }
         }
     }
 }
@@ -5113,6 +5115,268 @@ function Invoke-Switchover-Interactive {
     } catch {
         Write-Log "Switchover Failed: $_" -ForegroundColor Red
     }
+    Read-Host "Press Enter to menu..."
+}
+
+function Invoke-BatchSwitchoverStop-Interactive {
+    <#
+    .DESCRIPTION
+    Batch version of Invoke-Switchover-Interactive: multi-select several Blue/Green
+    deployments, switchover all of them, then automatically stop each old Blue once its
+    switchover completes. There is no per-deployment stop Y/n — auto-stop is the whole point
+    of this command; use "Execute Switchover" for the single-deployment flow with the
+    optional stop prompt and interactive lag-wait submenu.
+    #>
+    $bgs = Get-BlueGreenDeployments
+    if (!$bgs) {
+        Write-Host "No active Blue/Green deployments found." -ForegroundColor Yellow
+        Read-Host "Press Enter to menu..."
+        return
+    }
+
+    # Status is embedded in the label ("... (AVAILABLE)"), so the picker's existing
+    # type-to-filter box (-EnableFilter) already filters by status — type e.g. "AVAILABLE"
+    # to show only ready deployments, no separate filter screen needed.
+    $options = @($bgs | ForEach-Object {
+        $mark = if ($_.Status -eq "AVAILABLE") { "[READY]" } else { "[NOT READY]" }
+        "$mark $($_.BlueGreenDeploymentName) ($($_.Status))"
+    })
+
+    $indices = Show-Menu -Title "Select Deployments for Batch Switchover + Stop Old Blue (type e.g. AVAILABLE to filter by status)" -Options $options -EnableFilter -MultiSelect
+    # Show-Menu returns a plain int (-1 = ESC/cancel, -99 = F1/restart-session) instead of an
+    # array when the viewport engine signals instead of selecting — must be checked before
+    # treating $indices as a collection, otherwise $bgs[-99] silently indexes from the end.
+    if ($indices -is [int]) {
+        if ($indices -eq -99) { $global:RestartSessionSelection = $true }
+        return
+    }
+    if (!$indices -or $indices.Count -eq 0) { return }
+
+    $lagRetryDelay = Read-Host "Enter delay in seconds between replica lag re-checks (default: 5)"
+    if ([string]::IsNullOrWhiteSpace($lagRetryDelay) -or -not ($lagRetryDelay -match '^\d+$')) { $lagRetryDelay = 5 } else { $lagRetryDelay = [int]$lagRetryDelay }
+
+    # --- Pre-check each selected deployment (Status / Tasks / Replica Lag) ---
+    # ponytail: no interactive R/W/A lag-wait submenu here (too complex for N items) —
+    # a deployment failing any check is simply excluded from the batch below. Replica lag
+    # gets 3 automatic re-checks ($lagRetryDelay seconds apart) before being treated as failed.
+    $maxLagRetries = 3
+    $candidates = @($indices | ForEach-Object {
+        $bgObj = $bgs[$_]
+        $sourceId = Get-InstanceIdFromArn $bgObj.Source
+        $targetId = Get-InstanceIdFromArn $bgObj.Target
+
+        $lagSeconds = if ($targetId) { Get-ReplicaLagSeconds -InstanceId $targetId -LookbackMinutes 15 } else { $null }
+        $lagAttempt = 0
+        while (($lagSeconds -ne $null -and $lagSeconds -gt 1) -and $lagAttempt -lt $maxLagRetries) {
+            $lagAttempt++
+            Write-Log "Replica lag ${lagSeconds}s on $($bgObj.BlueGreenDeploymentName) — retry $lagAttempt/$maxLagRetries in ${lagRetryDelay}s..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $lagRetryDelay
+            $lagSeconds = Get-ReplicaLagSeconds -InstanceId $targetId -LookbackMinutes 5
+        }
+
+        $tasksOk = $true
+        if ($bgObj.Tasks) {
+            $incomplete = $bgObj.Tasks | Where-Object { $_.Status -ne "COMPLETED" -and $_.Status -ne "N/A" }
+            if ($incomplete) { $tasksOk = $false }
+        }
+
+        $lagOk = -not ($lagSeconds -ne $null -and $lagSeconds -gt 1)
+        $eligible = ($bgObj.Status -eq "AVAILABLE") -and $tasksOk -and $lagOk
+
+        $reasons = @()
+        if ($bgObj.Status -ne "AVAILABLE") { $reasons += "status is $($bgObj.Status)" }
+        if (-not $tasksOk) { $reasons += "tasks incomplete" }
+        if (-not $lagOk) { $reasons += "replica lag ${lagSeconds}s after $maxLagRetries retries" }
+
+        [PSCustomObject]@{
+            BGId       = $bgObj.BlueGreenDeploymentIdentifier
+            BGName     = $bgObj.BlueGreenDeploymentName
+            SourceId   = $sourceId
+            Status     = $bgObj.Status
+            TasksOk    = $tasksOk
+            LagSeconds = $lagSeconds
+            LagAttempt = $lagAttempt
+            Eligible   = $eligible
+            FailReason = ($reasons -join "; ")
+        }
+    })
+
+    Show-Header
+    Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║   BATCH SWITCHOVER + STOP OLD BLUE — PRE-CHECK   ║" -ForegroundColor Cyan
+    Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    foreach ($c in $candidates) {
+        $lagText = if ($c.LagSeconds -ne $null) { "$($c.LagSeconds)s" } else { "No Data" }
+        if ($c.LagAttempt -gt 0) { $lagText += " (after $($c.LagAttempt) retries)" }
+        $tasksText = if ($c.TasksOk) { "OK" } else { "INCOMPLETE" }
+        $tag = if ($c.Eligible) { "[INCLUDE]" } else { "[SKIP]   " }
+        $color = if ($c.Eligible) { "Green" } else { "Red" }
+        Write-Host "  $tag $($c.BGName)  Status=$($c.Status) Tasks=$tasksText Lag=$lagText" -ForegroundColor $color
+    }
+    Write-Host ""
+
+    $toRun = @($candidates | Where-Object { $_.Eligible })
+    if ($toRun.Count -eq 0) {
+        Write-Host "No selected deployment passed the pre-check. Nothing to do." -ForegroundColor Yellow
+        Read-Host "Press Enter to menu..."
+        return
+    }
+
+    Write-Host "This will SWITCHOVER and then STOP the old Blue instance for:" -ForegroundColor Yellow
+    foreach ($c in $toRun) {
+        Write-Host "  - $($c.BGName)  (old Blue '$($c.SourceId)' will be stopped after switchover)" -ForegroundColor White
+    }
+    Write-Host ""
+
+    if (-not (Confirm-DestructivePhrase -Prompt "Type 'PROMOTE' to confirm switchover of $($toRun.Count) deployment(s)" -Phrase "PROMOTE")) {
+        Write-Host "Operation cancelled." -ForegroundColor Yellow
+        Read-Host "Press Enter to menu..."
+        return
+    }
+
+    $timeout = Read-Host "Enter Timeout in seconds per deployment (default: 300)"
+    if ([string]::IsNullOrWhiteSpace($timeout) -or -not ($timeout -match '^\d+$')) { $timeout = "300" }
+    # Poll budget must cover the AWS-side switchover-timeout the user just entered, not a
+    # fixed guess — otherwise a deployment legitimately still finishing gets marked TIMED_OUT.
+    $maxPolls = [math]::Max(40, [math]::Ceiling(([int]$timeout + 300) / 15))
+
+    # --- Kick-off: fire all switchovers first (cheap API calls), poll them together below ---
+    foreach ($c in $toRun) {
+        try {
+            $swArgs = @("rds", "switchover-blue-green-deployment", "--blue-green-deployment-identifier", $c.BGId, "--switchover-timeout", $timeout, "--profile", $global:AWSProfile)
+            Invoke-AWS-WithRetry -Arguments $swArgs | Out-Null
+            $c | Add-Member -NotePropertyName FinalStatus -NotePropertyValue "IN_PROGRESS"
+            Write-Log "Switchover started for $($c.BGName)" -ForegroundColor Cyan
+        } catch {
+            $c | Add-Member -NotePropertyName FinalStatus -NotePropertyValue "FAILED_TO_START"
+            $c | Add-Member -NotePropertyName SwitchoverError -NotePropertyValue "$_"
+            Write-Log "Failed to start switchover for $($c.BGName): $_" -ForegroundColor Red
+        }
+    }
+    $global:RDSInstancesCache = $null
+    $script:BGDeploymentsCache = $null
+
+    # --- Combined poll loop: one dashboard for every deployment, not sequential blocking waits ---
+    $started = @($toRun | Where-Object { $_.FinalStatus -eq "IN_PROGRESS" })
+    $pollCount = 0
+    Write-Host ""
+    Write-Host "Polling switchover status for $($started.Count) deployment(s)..." -ForegroundColor Cyan
+    while (@($started | Where-Object { $_.FinalStatus -eq "IN_PROGRESS" }).Count -gt 0 -and $pollCount -lt $maxPolls) {
+        Start-Sleep -Seconds 15
+        $pollCount++
+        $liveBgs = Get-BlueGreenDeployments -Force
+        $elapsed = [math]::Round($pollCount * 15 / 60, 1)
+        Write-Host ""
+        Write-Host "  [${elapsed}m]" -ForegroundColor DarkGray
+        foreach ($c in $started) {
+            if ($c.FinalStatus -ne "IN_PROGRESS") { continue }
+            $live = $liveBgs | Where-Object { $_.BlueGreenDeploymentIdentifier -eq $c.BGId }
+            $currentStatus = if ($live) { $live.Status } else { "UNKNOWN" }
+            Write-Host "    $($c.BGName): $currentStatus" -ForegroundColor Gray
+            if ($currentStatus -eq "SWITCHOVER_COMPLETED") {
+                $c.FinalStatus = "SWITCHOVER_COMPLETED"
+                $c | Add-Member -NotePropertyName OldBlueId -NotePropertyValue (Get-InstanceIdFromArn $live.Source)
+            } elseif ($currentStatus -eq "SWITCHOVER_FAILED" -or $currentStatus -eq "INVALID_CONFIGURATION") {
+                $c.FinalStatus = $currentStatus
+            }
+        }
+    }
+    foreach ($c in ($started | Where-Object { $_.FinalStatus -eq "IN_PROGRESS" })) {
+        $c.FinalStatus = "TIMED_OUT"
+    }
+
+    $global:RDSInstancesCache = $null
+    $script:BGDeploymentsCache = $null
+
+    # --- Stop old Blue for every deployment that completed successfully ---
+    # ponytail: stop-db-instance only, same as Invoke-Switchover-Interactive above — Aurora
+    # cluster Blue/Greens (stop-db-cluster) aren't handled by either flow; AWS call fails
+    # gracefully into StopResult below instead of crashing, add Resolve-SnapshotTarget-style
+    # Aurora detection to both flows together if that becomes a real case.
+    $toStop = @($started | Where-Object { $_.FinalStatus -eq "SWITCHOVER_COMPLETED" })
+    foreach ($c in $toStop) {
+        $oldBlueId = if ($c.OldBlueId) { $c.OldBlueId } else { $c.SourceId }
+        try {
+            $stopArgs = @("rds", "stop-db-instance", "--db-instance-identifier", $oldBlueId, "--profile", $global:AWSProfile)
+            Invoke-AWS-WithRetry -Arguments $stopArgs | Out-Null
+            $c | Add-Member -NotePropertyName StopResult -NotePropertyValue "stopping"
+        } catch {
+            $c | Add-Member -NotePropertyName StopResult -NotePropertyValue "stop command failed: $_"
+        }
+    }
+    $global:RDSInstancesCache = $null
+
+    # --- Verify actual instance state once (no waiting for "stopped" — stopping an RDS
+    # instance takes minutes, we just report whatever the real state is right now, same
+    # as the user asked: say "stopping" if that's what it actually is). User can press R
+    # on this same screen to re-check instead of us auto-polling in a loop. ---
+    $pendingStops = @($toStop | Where-Object { $_.StopResult -eq "stopping" })
+    while ($pendingStops.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Checking old Blue instance status..." -ForegroundColor Cyan
+        foreach ($c in $pendingStops) {
+            $oldBlueId = if ($c.OldBlueId) { $c.OldBlueId } else { $c.SourceId }
+            $liveStatus = $null
+            try {
+                $statArgs = @("rds", "describe-db-instances", "--db-instance-identifier", $oldBlueId, "--query", "DBInstances[0].DBInstanceStatus", "--output", "text", "--profile", $global:AWSProfile)
+                $liveStatus = ((Invoke-AWS-WithRetry -Arguments $statArgs) -join "").Trim()
+            } catch {
+                $liveStatus = $null
+            }
+            if ($liveStatus) { $c.StopResult = $liveStatus }
+            Write-Host "    ${oldBlueId}: $($c.StopResult)" -ForegroundColor Gray
+        }
+        Write-Host ""
+        $resp = Read-Host "Press R to refresh status, or Enter to continue to summary"
+        if ($resp.Trim().ToUpper() -ne 'R') { break }
+    }
+    $global:RDSInstancesCache = $null
+
+    # --- Summary ---
+    Show-Header
+    Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║   BATCH SWITCHOVER + STOP OLD BLUE — SUMMARY     ║" -ForegroundColor Cyan
+    Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    foreach ($c in $toRun) {
+        Write-Host "  $($c.BGName)" -ForegroundColor White
+        if ($c.FinalStatus -eq "FAILED_TO_START") {
+            Write-Host "    Switchover: FAILED TO START — $($c.SwitchoverError)" -ForegroundColor Red
+            Write-Host ""
+            continue
+        }
+        $swColor = if ($c.FinalStatus -eq "SWITCHOVER_COMPLETED") { "Green" } else { "Red" }
+        Write-Host "    Switchover: $($c.FinalStatus)" -ForegroundColor $swColor
+        if ($c.FinalStatus -eq "SWITCHOVER_COMPLETED") {
+            $stopColor = if ($c.StopResult -eq "stopped") { "Green" } elseif ($c.StopResult -like "stopping*") { "Yellow" } else { "Red" }
+            Write-Host "    Old Blue ($($c.OldBlueId)): $($c.StopResult)" -ForegroundColor $stopColor
+        }
+        Write-Host ""
+    }
+    $skipped = @($candidates | Where-Object { -not $_.Eligible })
+    if ($skipped.Count -gt 0) {
+        Write-Host "  Skipped (failed pre-check):" -ForegroundColor Yellow
+        foreach ($c in $skipped) { Write-Host "    - $($c.BGName)" -ForegroundColor DarkYellow }
+    }
+
+    # Plain-text, copy-paste-ready lines for client communication (no colors/prefixes)
+    Write-Host ""
+    Write-Host "  ───────────────────────────────────────────── (copy below) ─────" -ForegroundColor DarkGray
+    foreach ($c in $toRun) {
+        $line = switch ($c.FinalStatus) {
+            "FAILED_TO_START"      { "$($c.BGName) switchover failed to start" }
+            "SWITCHOVER_COMPLETED" { "$($c.BGName) switchover complete, $($c.OldBlueId) $($c.StopResult)" }
+            "TIMED_OUT"            { "$($c.BGName) switchover still in progress (timed out waiting)" }
+            default                { "$($c.BGName) switchover failed (status: $($c.FinalStatus))" }
+        }
+        Write-Host $line
+    }
+    foreach ($c in $skipped) {
+        Write-Host "$($c.BGName) skipped, pre-check failed ($($c.FailReason))"
+    }
+    Write-Host "  ───────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+
     Read-Host "Press Enter to menu..."
 }
 
