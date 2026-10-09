@@ -1,4 +1,4 @@
-# VERSION: 2026.07.08.01
+# VERSION: 2026.10.09.04
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,16 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-10-09
+    - CHANGE: Daily log files (`rds_manager_YYYYMMDD.log`) now go to a `logs` folder next to the script (created on startup) instead of the current directory. An absolute `LogFileFormat` in the config is still honoured.
+    - FEATURE: Client Resource Inventory module "AWS recommendations" (column AWSRecs): active RDS Recommendations (`rds describe-db-recommendations`) plus Compute Optimizer findings for RDS instances/storage and EC2 (non-Optimized only, with the suggested size). Compute Optimizer needs opt-in per account; if it is not enabled the failed call shows up under "Scan problems".
+    - FEATURE: Client Resource Inventory now opens a module menu before the scan (SPACE = add, ENTER = start). Nothing selected = the original 7-column scan, unchanged. Modules: Account ID, Multi-region (asks for regions / 'all'), Storage (type/GB/IOPS/throughput/autoscaling max; EC2 via EBS volumes), Availability (Multi-AZ, AZ, writer/reader/replica role), Security (encryption, public, deletion protection, IAM auth, CA cert), Configuration (created, backup days, auto minor upgrade, maint. window, parameter group, PI, Serverless v2 ACU, AMI, IAM profile), Tags, Blue/Green source/target, Manual snapshots (count/GB), Usage (14-day CPU / max connections from CloudWatch), Pending maintenance, Audit flags (NOENC PUBLIC NO-BACKUP NO-DELPROT SINGLE-AZ GP2 STOPPED OLD-CA IDLE ...), Waste finder (unattached EBS, unassociated Elastic IPs, orphaned manual snapshots), Other services (RDS Proxy, ElastiCache, OpenSearch), Cost (last month's RDS/EC2 bill from Cost Explorer), Scan problems (failed calls grouped per profile/region instead of silently skipped), Summary.
+    - CHANGE: Exports (CSV/HTML) now default to a `reports` folder next to the script (created on demand). HTML header shows "Created by: <OS username, no domain>" instead of the AWS profile.
+    - REMOVED: "AWS Sessions (Assume/Granted)" main menu entry and `Show-AWSSessions-Menu`.
+    - FEATURE: HTML export (`Export-Report`, all reports) is now interactive: global search, per-column filters (dropdown for <=15 distinct values), click-to-sort, row checkboxes + "selected only", column show/hide, CSV download of selected/visible rows; sticky header, stronger zebra striping, colored pills for Type/Profile/Status and chips for audit Flags.
+    - FEATURE: Client Resource Inventory asks which profiles of the client to scan (SPACE = pick, nothing selected = all; skipped when the client has one profile).
+    - REFACTOR: the PS7-parallel and PS5.1-sequential inventory scans shared ~190 duplicated lines; both now run one scan scriptblock (`$script:InventoryScanBlock`) per profile x region.
+    - UX: with modules selected the report is printed as one table per resource type, empty columns hidden, columns split into chunks that fit the console width. CSV/HTML export always contains every selected column.
     2026-07-08
     - FEATURE: Post-switchover "Zatrzymac stary Blue?" prompt now defaults to Yes — Enter stops the old Blue instance, type 'n' to skip. Forces apps still pointed at the old endpoint to fail over to the new one.
     - FEATURE: `New-BGDeployment-Interactive` asks for a task number before naming the deployment; if given, it's appended to the default name (`bg-deployment-<source>-<task>`). Remembered for the session in `$global:LastBGTaskNr` — next deployment offers Enter-to-reuse or 'x' to clear.
@@ -274,6 +284,11 @@ $ErrorActionPreference = "Stop"
 $global:AWSProfile = $null
 $global:SelectedInstance = $null
 $global:LogFile = $Global:Config.LogFileFormat -f (Get-Date)
+if (-not [System.IO.Path]::IsPathRooted($global:LogFile)) {
+    $logDir = Join-Path $PSScriptRoot "logs"
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+    $global:LogFile = Join-Path $logDir $global:LogFile
+}
 $global:UpdateUrl = $Global:Config.UpdateUrl
 if ($global:UpdateUrl -and $global:UpdateUrl -notmatch '^https://') {
     Write-Host "Config Warning: UpdateUrl must be an https:// URL. OTA updates disabled." -ForegroundColor Yellow
@@ -1488,11 +1503,14 @@ function Export-Report {
             return
         }
 
-        $defaultPath = ".\$DefaultFileName$ext"
+        $reportsDir = Join-Path $PSScriptRoot "reports"
+        $defaultPath = Join-Path $reportsDir "$DefaultFileName$ext"
         $path = Read-Host "Enter output file path (default: $defaultPath)"
         if ([string]::IsNullOrWhiteSpace($path)) { $path = $defaultPath }
 
         try {
+            $dir = Split-Path -Parent $path
+            if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
             if ($format -eq "1") {
                 $Data | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
             } elseif ($format -eq "2") {
@@ -1514,20 +1532,48 @@ function Export-Report {
 <style>
   body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background: #fafbfc; color: #333; }
   h2 { color: #1e3a5f; margin-bottom: 4px; }
-  .meta { color: #888; font-size: 0.85em; margin-bottom: 16px; }
-  table { border-collapse: collapse; width: 100%; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
-  th { background: #1e3a5f; color: #fff; padding: 10px 14px; text-align: left; font-weight: 600; border: 1px solid #16304d; }
-  td { padding: 8px 14px; border: 1px solid #dde1e6; }
-  tr:nth-child(even) { background: #f2f4f7; }
-  tr:nth-child(odd) { background: #ffffff; }
-  tr:hover { background: #e0ecf8; }
+  .meta { color: #888; font-size: 0.85em; margin-bottom: 12px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+  .bar input[type=text] { padding: 6px 10px; border: 1px solid #b8c2cc; border-radius: 4px; min-width: 260px; }
+  .bar button, .bar summary { padding: 5px 12px; border: 1px solid #b8c2cc; border-radius: 4px; background: #fff; cursor: pointer; }
+  .bar details { position: relative; }
+  .bar details div { position: absolute; z-index: 20; background: #fff; border: 1px solid #b8c2cc; border-radius: 4px; padding: 8px 12px; max-height: 60vh; overflow: auto; box-shadow: 0 2px 8px rgba(0,0,0,.2); white-space: nowrap; }
+  .bar details label { display: block; padding: 2px 0; }
+  #cnt { color: #555; font-size: 0.9em; }
+  .wrap { overflow: auto; max-height: 80vh; box-shadow: 0 1px 4px rgba(0,0,0,0.15); }
+  table { border-collapse: separate; border-spacing: 0; width: 100%; }
+  th { background: #1e3a5f; color: #fff; padding: 8px 12px; text-align: left; font-weight: 600; position: sticky; top: 0; z-index: 2; white-space: nowrap; user-select: none; }
+  th.s { cursor: pointer; }
+  th.asc::after { content: ' \25B2'; } th.desc::after { content: ' \25BC'; }
+  tr.f th { background: #dfe6ee; padding: 4px 6px; z-index: 2; }
+  tr.f input, tr.f select { width: 100%; box-sizing: border-box; padding: 3px 4px; font-size: 0.9em; }
+  td { padding: 7px 12px; border-bottom: 1px solid #d5dbe2; vertical-align: top; line-height: 1.45; max-width: 420px; overflow-wrap: anywhere; background: #fff; }
+  tr.alt td { background: #eaf0f7; }
+  tr:hover td { background: #d4e6fb; }
+  tr.on td { background: #fff1b8; }
+  td.sel, th:first-child { width: 28px; text-align: center; }
+  td.dim { color: #b5bcc4; }
+  .pill, .chip { display: inline-block; padding: 1px 9px; border-radius: 10px; font-size: 0.88em; white-space: nowrap; }
+  .chip { margin: 0 4px 2px 0; border-radius: 4px; font-weight: 600; font-size: 0.8em; }
+  .ok { background: #d3f0dc; color: #14602e; } .warn { background: #ffe9b8; color: #7a4a00; }
+  .bad { background: #f9d0d0; color: #8a1414; } .neu { background: #e3e7ec; color: #444; }
+  [hidden] { display: none !important; }
   .footer { color: #888; font-size: 0.8em; margin-top: 12px; }
 </style>
 </head>
 <body>
 <h2>$DefaultFileName</h2>
-<div class="meta">Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Profile: $global:AWSProfile</div>
-<table>
+<div class="meta">Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Created by: $([System.Net.WebUtility]::HtmlEncode(([Environment]::UserName -replace '^.*\\' -replace '@.*$')))</div>
+<div class="bar">
+  <input type="text" id="q" placeholder="Search all columns (space = AND)">
+  <label><input type="checkbox" id="so"> selected only</label>
+  <details><summary>Columns</summary><div id="cols"></div></details>
+  <button id="clr">Clear filters</button>
+  <button id="dsel">Deselect all</button>
+  <button id="csv">Download CSV (selected, else visible)</button>
+  <span id="cnt"></span>
+</div>
+<div class="wrap"><table id="t">
 <thead><tr>
 "@)
                 foreach ($prop in $properties) {
@@ -1546,8 +1592,108 @@ function Export-Report {
                     [void]$htmlSb.AppendLine("</tr>")
                 }
 
-                [void]$htmlSb.AppendLine("</tbody></table>")
+                [void]$htmlSb.AppendLine("</tbody></table></div>")
                 [void]$htmlSb.AppendLine("<div class='footer'>Rows: $($Data.Count) | AWS RDS Blue/Green Deployment Manager</div>")
+                [void]$htmlSb.AppendLine(@'
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const t = $('t'), tb = t.tBodies[0], hr = t.tHead.rows[0];
+  const rows = [].slice.call(tb.rows);
+  const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+  const hue = s => { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 10; };
+  const pal = document.head.appendChild(el('style'));
+  for (let k = 0; k < 10; k++) pal.textContent += '.p' + k + '{background:hsl(' + k * 36 + ',65%,88%);color:hsl(' + k * 36 + ',55%,25%)}';
+  const ST_BAD = /fail|stopped|error|incompatible|deleting|terminated|inaccessible|unavailable/i,
+        ST_WARN = /stopping|pending|modifying|upgrading|backing|rebooting|creating|switching|storage-optim|configuring/i,
+        ST_OK = /^(available|running|active|in-use|completed|enabled|associated)$/i,
+        FLAG_BAD = /^(NOENC|PUBLIC|PUBLIC-IP|UNENC-VOL|NO-BACKUP)$/;
+
+  const th0 = el('th'), all = el('input'); all.type = 'checkbox'; th0.appendChild(all); hr.insertBefore(th0, hr.firstChild);
+  const names = [].map.call(hr.cells, c => c.textContent), n = names.length;
+
+  rows.forEach(r => {
+    const cb = el('input'); cb.type = 'checkbox'; cb.addEventListener('change', () => { r.classList.toggle('on', cb.checked); apply(); });
+    r.insertCell(0).className = 'sel'; r.cells[0].appendChild(cb);
+    const parts = [];
+    for (let i = 1; i < n; i++) {
+      const td = r.cells[i], v = td.textContent, nm = names[i];
+      td.dataset.v = v; parts.push(v);
+      if (v === '-' || v === '') { td.className = 'dim'; continue; }
+      if (nm === 'Type' || nm === 'Profile') { td.textContent = ''; td.appendChild(el('span', 'pill p' + hue(v), v)); }
+      else if (nm === 'Status') { td.textContent = ''; td.appendChild(el('span', 'pill ' + (ST_BAD.test(v) ? 'bad' : ST_WARN.test(v) ? 'warn' : ST_OK.test(v) ? 'ok' : 'neu'), v)); }
+      else if (nm === 'Flags') { td.textContent = ''; v.split(/[\s,]+/).forEach(f => { if (f) td.appendChild(el('span', 'chip ' + (FLAG_BAD.test(f) ? 'bad' : 'warn'), f)); }); }
+    }
+    r.dataset.s = parts.join('\u0001').toLowerCase();
+  });
+
+  const fr = t.tHead.insertRow(); fr.className = 'f'; const fils = [];
+  for (let i = 0; i < n; i++) {
+    const th = el('th'); fr.appendChild(th); fils.push(null);
+    if (i === 0) continue;
+    const ks = Object.keys(rows.reduce((o, r) => (o[r.cells[i].dataset.v] = 1, o), {})).sort();
+    let f;
+    if (ks.length <= 15) { f = el('select'); f.add(new Option('', '')); ks.forEach(k => f.add(new Option(k, k))); }
+    else { f = el('input'); f.placeholder = 'filter'; }
+    f.addEventListener('input', apply); th.appendChild(f); fils[i] = f;
+  }
+  [].forEach.call(fr.cells, c => c.style.top = hr.offsetHeight + 'px');
+
+  function apply() {
+    const terms = $('q').value.toLowerCase().split(/\s+/).filter(Boolean), so = $('so').checked;
+    let vis = 0, sel = 0, alt = 0;
+    rows.forEach(r => {
+      const on = r.cells[0].firstChild.checked; if (on) sel++;
+      let ok = (!so || on) && terms.every(x => r.dataset.s.indexOf(x) >= 0);
+      for (let i = 1; ok && i < n; i++) {
+        const v = fils[i].value; if (!v) continue;
+        const c = r.cells[i].dataset.v;
+        ok = fils[i].tagName === 'SELECT' ? c === v : c.toLowerCase().indexOf(v.toLowerCase()) >= 0;
+      }
+      r.hidden = !ok;
+      if (ok) { vis++; r.classList.toggle('alt', alt++ % 2 === 1); }
+    });
+    $('cnt').textContent = vis + ' / ' + rows.length + ' rows, ' + sel + ' selected';
+  }
+
+  let sc = -1, sd = 1;
+  const cmp = (a, b) => (a !== '' && b !== '' && !isNaN(a) && !isNaN(b)) ? a - b : a.localeCompare(b, undefined, { numeric: true });
+  for (let i = 1; i < n; i++) {
+    hr.cells[i].classList.add('s');
+    hr.cells[i].addEventListener('click', () => {
+      sd = sc === i ? -sd : 1; sc = i;
+      [].forEach.call(hr.cells, c => c.classList.remove('asc', 'desc')); hr.cells[i].classList.add(sd > 0 ? 'asc' : 'desc');
+      rows.sort((a, b) => cmp(a.cells[i].dataset.v, b.cells[i].dataset.v) * sd).forEach(r => tb.appendChild(r));
+      apply();
+    });
+  }
+
+  const colStyle = document.head.appendChild(el('style'));
+  const hid = new Set();
+  for (let i = 1; i < n; i++) {
+    const lb = el('label'), cb = el('input'); cb.type = 'checkbox'; cb.checked = true;
+    cb.addEventListener('change', () => {
+      cb.checked ? hid.delete(i) : hid.add(i);
+      colStyle.textContent = [...hid].map(k => '#t th:nth-child(' + (k + 1) + '),#t td:nth-child(' + (k + 1) + '){display:none}').join('');
+    });
+    lb.appendChild(cb); lb.appendChild(document.createTextNode(' ' + names[i])); $('cols').appendChild(lb);
+  }
+
+  all.addEventListener('change', () => { rows.forEach(r => { if (!r.hidden) { r.cells[0].firstChild.checked = all.checked; r.classList.toggle('on', all.checked); } }); apply(); });
+  $('q').addEventListener('input', apply); $('so').addEventListener('change', apply);
+  $('clr').addEventListener('click', () => { $('q').value = ''; $('so').checked = false; fils.forEach(f => f && (f.value = '')); apply(); });
+  $('dsel').addEventListener('click', () => { all.checked = false; rows.forEach(r => { r.cells[0].firstChild.checked = false; r.classList.remove('on'); }); apply(); });
+  $('csv').addEventListener('click', () => {
+    const picked = rows.filter(r => r.cells[0].firstChild.checked), src = picked.length ? picked : rows.filter(r => !r.hidden);
+    const cols = []; for (let i = 1; i < n; i++) if (!hid.has(i)) cols.push(i);
+    const q = s => '"' + String(s).replace(/"/g, '""') + '"';
+    const csv = [cols.map(i => q(names[i]))].concat(src.map(r => cols.map(i => q(r.cells[i].dataset.v)))).map(l => l.join(',')).join('\r\n');
+    const a = el('a'); a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv' })); a.download = document.title + '-selected.csv'; a.click();
+  });
+  apply();
+})();
+</script>
+'@)
                 [void]$htmlSb.AppendLine("</body></html>")
 
                 $htmlSb.ToString() | Out-File -FilePath $path -Encoding UTF8
@@ -4499,66 +4645,6 @@ function Monitor-BGStatus-Interactive {
     try { [Console]::CursorVisible = $true } catch {}
 }
 
-function Show-AWSSessions-Menu {
-    # Check for granted tools in script directory
-    # Priority: assume.ps1 (PowerShell wrapper) > assume.bat > granted.exe > assumego.exe
-    $tools = @("assume.ps1", "assume.bat", "assume", "granted.exe", "assumego.exe")
-    $foundTool = $null
-
-    foreach ($t in $tools) {
-        $path = Join-Path $PSScriptRoot $t
-        if (Test-Path $path) {
-            $foundTool = $path
-            break
-        }
-    }
-
-    $title = "AWS Sessions (Granted/Assume)"
-    if ($foundTool) {
-        $menuOptions = @(
-            "Run Assume/Granted ($foundTool)",
-            "Back"
-        )
-    } else {
-        $menuOptions = @(
-            "Tool not found (Instructions)",
-            "Back"
-        )
-    }
-
-    $idx = Show-Menu -Title $title -Options $menuOptions
-    if ($idx -eq ($menuOptions.Count - 1)) { return } # Back
-    if ($idx -lt 0) { return } # ESC
-
-    if ($foundTool) {
-        Write-Host "Launching $foundTool..." -ForegroundColor Green
-        try {
-            if ($foundTool.EndsWith(".ps1")) {
-                # Run PowerShell script directly in current console
-                & $foundTool
-            } elseif ($foundTool.EndsWith(".bat") -or $foundTool.EndsWith(".cmd")) {
-                # Run Batch file
-                & $foundTool
-            } else {
-                # Executables
-                Start-Process -FilePath $foundTool -Wait -NoNewWindow
-            }
-        } catch {
-            Write-Host "Error running tool: $_" -ForegroundColor Red
-            Read-Host "Press Enter to continue..."
-        }
-    } else {
-        Show-Header
-        Write-Host "INSTRUCTIONS" -ForegroundColor Yellow
-        Write-Host "To use this feature, please download 'granted' or 'assume' tools."
-        Write-Host "Place one of the following files in the script directory:"
-        Write-Host " - $PSScriptRoot"
-        Write-Host "`nSupported files: $($tools -join ', ')"
-        Write-Host "`nVisit: https://docs.commonfate.io/granted/getting-started" -ForegroundColor Cyan
-        Read-Host "Press Enter to return..."
-    }
-}
-
 function Remove-BGDeployment-Interactive {
     $bgs = Get-BlueGreenDeployments
     if (!$bgs) {
@@ -6021,6 +6107,322 @@ function Upgrade-Database-Interactive {
     Read-Host "Press Enter to menu..."
 }
 
+# ---- Client Resource Inventory: optional scan modules ----------------------------------------
+# Nothing selected in the module menu = the original 7-column scan (Profile/Type/Name/Status/Engine/Class/Endpoint).
+# Prefix = column goes right after Profile; Heavy = excluded from the [ALL] shortcut (needs input / costs money).
+$script:InventoryModules = @(
+    @{ Key='Account';     Prefix=$true;  Columns=@('AccountId');                                              Label='Account ID';          Desc='AccountId column (1 sts call per scan unit)' }
+    @{ Key='Regions';     Prefix=$true;  Heavy=$true; Columns=@('Region');                                    Label='Multi-region';        Desc='scan more than the profile default region (asks which)' }
+    @{ Key='Storage';     Columns=@('StorageType','StorageGB','Iops','Throughput','MaxStorageGB');            Label='Storage';             Desc='disk type, size, IOPS, throughput, autoscaling limit (EC2: EBS volumes)' }
+    @{ Key='HA';          Columns=@('Role','MultiAZ','AZ');                                                   Label='Availability';        Desc='Multi-AZ, AZ, writer/reader/replica role' }
+    @{ Key='Security';    Columns=@('Encrypted','Public','DelProtect','IamAuth','CACert');                    Label='Security';            Desc='encryption, public access, deletion protection, IAM auth, CA cert' }
+    @{ Key='Config';      Columns=@('Created','BackupDays','AutoMinor','MaintWindow','ParamGroup','PerfInsights','Capacity','AMI','IamProfile'); Label='Configuration'; Desc='created, backup retention, auto minor upgrade, maint. window, param group, PI, ACU, AMI' }
+    @{ Key='Tags';        Columns=@('Monitoring','Tags');                                                     Label='Tags';                Desc='SSG-MONITORING value + all tags' }
+    @{ Key='BG';          Columns=@('BGSource','BGTarget');                                                   Label='Blue/Green details';  Desc='Blue (source) and Green (target) names of each deployment' }
+    @{ Key='Snapshots';   Columns=@('Snapshots','SnapshotGB');                                                Label='Manual snapshots';    Desc='count (+GB for instances) per instance/cluster (2 extra calls)' }
+    @{ Key='Metrics';     Columns=@('CPU14d','ConnMax14d');                                                   Label='Usage (CloudWatch)';  Desc='14-day avg CPU, max connections (idle detection)' }
+    @{ Key='Maintenance'; Columns=@('Pending');                                                               Label='Pending maintenance'; Desc='pending maintenance actions per RDS resource' }
+    @{ Key='Flags';       Columns=@('Flags');                                                                 Label='Audit flags';         Desc='NOENC PUBLIC NO-BACKUP NO-DELPROT SINGLE-AZ GP2 STOPPED OLD-CA IDLE ...' }
+    @{ Key='Recs';        Columns=@('AWSRecs');                                                               Label='AWS recommendations'; Desc='RDS recommendations + Compute Optimizer (RDS, EC2) per resource (needs CO opt-in)' }
+    @{ Key='Hygiene';     Columns=@();                                                                        Label='Waste finder';        Desc='extra rows: unattached EBS, unassociated Elastic IPs, orphaned manual snapshots' }
+    @{ Key='Other';       Columns=@();                                                                        Label='Other services';      Desc='extra rows: RDS Proxy, ElastiCache, OpenSearch' }
+    @{ Key='Cost';        Heavy=$true; Columns=@('CostUSD');                                                  Label='Cost (last month)';   Desc='extra rows: RDS/EC2 bill from Cost Explorer (~$0.01 per profile)' }
+    @{ Key='Errors';      Columns=@();                                                                        Label='Scan problems';       Desc='list calls that failed (AccessDenied, expired SSO...) instead of skipping silently' }
+    @{ Key='Summary';     Columns=@();                                                                        Label='Summary';             Desc='totals per type and per profile' }
+)
+
+# One scan unit = one profile in one region. Returns @{ Rows; Errors }. Self-contained (no script
+# functions) because on PS7 it is re-created from text inside ForEach-Object -Parallel runspaces.
+$script:InventoryScanBlock = {
+    param($unit, $opt)
+    $ErrorActionPreference = 'Continue'
+    $prof   = $unit.Profile
+    $region = $unit.Region
+    $tag    = if ($region) { "$prof/$region" } else { $prof }
+    $rows   = [System.Collections.Generic.List[object]]::new()
+    $errs   = [System.Collections.Generic.List[string]]::new()
+    $base   = @('--profile', $prof, '--output', 'json', '--no-cli-pager')
+    if ($region) { $base += @('--region', $region) }
+
+    function Q([string[]]$a) {
+        $o    = & aws @a @base 2>&1
+        $code = $LASTEXITCODE
+        if ($code -ne 0) {
+            $m = (@($o | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join ' ') -replace '\s+', ' '
+            if ($m.Length -gt 170) { $m = $m.Substring(0, 170) }
+            $errs.Add("$tag [$($a[0]) $($a[1])]: $($m.Trim())")
+            return
+        }
+        $txt = (@($o | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join '')
+        if (-not $txt) { return }
+        try { return ($txt | ConvertFrom-Json) } catch { $errs.Add("$tag [$($a[0]) $($a[1])]: bad JSON"); return }
+    }
+    function Fv($x) { if ($null -eq $x -or "$x" -eq '') { $null } elseif ($x -is [bool]) { if ($x) { 'Yes' } else { 'No' } } else { $x } }
+    function Fd($x) { if ($x) { try { ([datetime]$x).ToString('yyyy-MM-dd') } catch { "$x" } } }
+    function Ftags($t) { if ($t) { (@($t | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ') } }
+    function Ftag($t, $k) { ($t | Where-Object { $_.Key -eq $k } | Select-Object -First 1).Value }
+    function Fid($arn) { "$arn" -replace '^.*:', '' }
+    function AddRow($type, $name, $status, $engine, $class, $endpoint, $x) {
+        $r = [ordered]@{ Profile = $prof; Type = $type; Name = $name; Status = $status; Engine = $engine; Class = $class; Endpoint = $endpoint }
+        if ($acct)  { $r.AccountId = $acct }
+        if ($opt.Regions) { $r.Region = $regionLabel }
+        if ($x) { foreach ($k in $x.Keys) { $r[$k] = $x[$k] } }
+        $rows.Add([PSCustomObject]$r)
+    }
+    function Flg([string[]]$f) { if ($f.Count) { $f -join ',' } }
+
+    $acct = $null
+    if ($opt.Account) { $acct = Q @('sts', 'get-caller-identity', '--query', 'Account') }
+    $regionLabel = $region
+    if ($opt.Regions -and -not $region) { $regionLabel = ((& aws configure get region --profile $prof 2>$null) -join '').Trim() }
+
+    # ---- core describes (always fetched with full field set; only selected modules show the extras)
+    $instances = @(Q @('rds', 'describe-db-instances', '--query', 'DBInstances[*].{Id:DBInstanceIdentifier,Engine:Engine,Ver:EngineVersion,Status:DBInstanceStatus,Class:DBInstanceClass,Endpoint:Endpoint.Address,StorageType:StorageType,Alloc:AllocatedStorage,MaxAlloc:MaxAllocatedStorage,Iops:Iops,Thru:StorageThroughput,MultiAZ:MultiAZ,AZ:AvailabilityZone,Enc:StorageEncrypted,Public:PubliclyAccessible,DelProt:DeletionProtection,Backup:BackupRetentionPeriod,AutoMinor:AutoMinorVersionUpgrade,Maint:PreferredMaintenanceWindow,CA:CACertificateIdentifier,PI:PerformanceInsightsEnabled,Created:InstanceCreateTime,Replica:ReadReplicaSourceDBInstanceIdentifier,Cluster:DBClusterIdentifier,IamAuth:IAMDatabaseAuthenticationEnabled,PG:DBParameterGroups[0].DBParameterGroupName,Tags:TagList}'))
+    $clusters  = @(Q @('rds', 'describe-db-clusters', '--query', 'DBClusters[*].{Id:DBClusterIdentifier,Status:Status,Engine:Engine,Ver:EngineVersion,Endpoint:Endpoint,StorageType:StorageType,MultiAZ:MultiAZ,Enc:StorageEncrypted,DelProt:DeletionProtection,Backup:BackupRetentionPeriod,AutoMinor:AutoMinorVersionUpgrade,Maint:PreferredMaintenanceWindow,Created:ClusterCreateTime,Members:DBClusterMembers[*].{Id:DBInstanceIdentifier,W:IsClusterWriter},Sls:ServerlessV2ScalingConfiguration,PG:DBClusterParameterGroup,IamAuth:IAMDatabaseAuthenticationEnabled,Tags:TagList}'))
+    $bgd       = Q @('rds', 'describe-blue-green-deployments', '--query', 'BlueGreenDeployments[*].{Name:BlueGreenDeploymentName,Status:Status,Source:Source,Target:Target,Created:CreateTime,Tags:Tags}')
+    $bgd       = @($bgd)
+    $ec2       = @(Q @('ec2', 'describe-instances', '--filters', 'Name=instance-state-name,Values=pending,running,stopping,stopped', '--query', 'Reservations[].Instances[].{Id:InstanceId,State:State.Name,Type:InstanceType,Ip:PrivateIpAddress,PubIp:PublicIpAddress,Az:Placement.AvailabilityZone,Launch:LaunchTime,Ami:ImageId,Iam:IamInstanceProfile.Arn,Tags:Tags}'))
+
+    # ---- optional extra calls
+    $vols = @()
+    if ($opt.Storage -or $opt.Security -or $opt.Flags -or $opt.Hygiene) {
+        $vols = @(Q @('ec2', 'describe-volumes', '--query', 'Volumes[*].{Id:VolumeId,Type:VolumeType,Size:Size,Iops:Iops,Thru:Throughput,Enc:Encrypted,State:State,Inst:Attachments[0].InstanceId}'))
+    }
+    $snapI = @(); $snapC = @()
+    if ($opt.Snapshots -or $opt.Hygiene) {
+        $snapI = @(Q @('rds', 'describe-db-snapshots', '--snapshot-type', 'manual', '--query', 'DBSnapshots[*].{Id:DBInstanceIdentifier,Size:AllocatedStorage}'))
+        $snapC = @(Q @('rds', 'describe-db-cluster-snapshots', '--snapshot-type', 'manual', '--query', 'DBClusterSnapshots[*].{Id:DBClusterIdentifier}'))
+    }
+    $pending = @{}
+    if ($opt.Maintenance) {
+        foreach ($p in @(Q @('rds', 'describe-pending-maintenance-actions', '--query', 'PendingMaintenanceActions[*].{Arn:ResourceIdentifier,Acts:PendingMaintenanceActionDetails[*].Action}'))) {
+            $pending[(Fid $p.Arn)] = (@($p.Acts) -join ',')
+        }
+    }
+    $met = @{}
+    if ($opt.Metrics) {
+        $items = [System.Collections.Generic.List[object]]::new()
+        foreach ($i in $instances) { if ($i.Status -eq 'available') { $items.Add(@{ Kind = 'rds'; Id = $i.Id }) } }
+        foreach ($e in $ec2)       { if ($e.State -eq 'running')    { $items.Add(@{ Kind = 'ec2'; Id = $e.Id }) } }
+        $end = (Get-Date).ToUniversalTime(); $start = $end.AddDays(-14)
+        for ($off = 0; $off -lt $items.Count; $off += 200) {
+            $chunk = $items.GetRange($off, [math]::Min(200, $items.Count - $off))
+            $qs = @()
+            for ($j = 0; $j -lt $chunk.Count; $j++) {
+                $it = $chunk[$j]
+                if ($it.Kind -eq 'rds') { $ns = 'AWS/RDS'; $dim = 'DBInstanceIdentifier' } else { $ns = 'AWS/EC2'; $dim = 'InstanceId' }
+                $d = @(@{ Name = $dim; Value = $it.Id })
+                $qs += @{ Id = "c$j"; ReturnData = $true; MetricStat = @{ Metric = @{ Namespace = $ns; MetricName = 'CPUUtilization'; Dimensions = $d }; Period = 86400; Stat = 'Average' } }
+                if ($it.Kind -eq 'rds') {
+                    $qs += @{ Id = "n$j"; ReturnData = $true; MetricStat = @{ Metric = @{ Namespace = $ns; MetricName = 'DatabaseConnections'; Dimensions = $d }; Period = 86400; Stat = 'Maximum' } }
+                }
+            }
+            $tmp = [System.IO.Path]::GetTempFileName()
+            try {
+                [System.IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject @($qs) -Depth 6 -Compress))
+                $res = Q @('cloudwatch', 'get-metric-data', '--start-time', $start.ToString('yyyy-MM-ddTHH:mm:ssZ'), '--end-time', $end.ToString('yyyy-MM-ddTHH:mm:ssZ'), '--metric-data-queries', "file://$tmp", '--query', 'MetricDataResults[*].{Id:Id,V:Values}')
+            } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+            foreach ($r in @($res)) {
+                if (-not $r.V -or @($r.V).Count -eq 0) { continue }
+                $it = $chunk[[int]($r.Id.Substring(1))]
+                $k  = "$($it.Kind):$($it.Id)"
+                if (-not $met.ContainsKey($k)) { $met[$k] = @{} }
+                if ($r.Id.StartsWith('c')) { $met[$k].Cpu  = [math]::Round(((@($r.V) | Measure-Object -Average).Average), 1) }
+                else                       { $met[$k].Conn = [math]::Round(((@($r.V) | Measure-Object -Maximum).Maximum), 0) }
+            }
+        }
+    }
+
+    # AWS recommendations: RDS Recommendations (DevOps Guru for RDS) + Compute Optimizer, keyed by resource id
+    $recs = @{}
+    function AddRec($arn, $text) {
+        $k = "$arn" -replace '^.*[:/]'
+        if (-not $recs.ContainsKey($k)) { $recs[$k] = [System.Collections.Generic.List[string]]::new() }
+        $recs[$k].Add($text)
+    }
+    function Frec($k) { if ($recs.ContainsKey($k)) { $recs[$k] -join '; ' } }
+    if ($opt.Recs) {
+        foreach ($r in @(Q @('rds', 'describe-db-recommendations', '--query', "DBRecommendations[?Status=='active'].{Arn:ResourceArn,Sev:Severity,T:TypeDetection,Id:TypeId}"))) {
+            AddRec $r.Arn "RDS [$($r.Sev)] $(if ($r.T) { $r.T } else { $r.Id })"
+        }
+        $co = Q @('compute-optimizer', 'get-rds-database-recommendations')
+        $coList = if ($co.rdsDBRecommendations) { $co.rdsDBRecommendations } else { $co.rdsDatabaseRecommendations }
+        foreach ($r in @($coList)) {
+            $fi = if ($r.instanceFinding) { $r.instanceFinding } else { $r.finding }
+            $opts = if ($r.instanceRecommendationOptions) { $r.instanceRecommendationOptions } else { $r.recommendationOptions }
+            $to = @($opts)[0].dbInstanceClass
+            if ($fi -and $fi -ne 'Optimized') { AddRec $r.resourceArn "CO instance: $fi$(if ($to) { " -> $to" })" }
+            if ($r.storageFinding -and $r.storageFinding -ne 'Optimized') { AddRec $r.resourceArn "CO storage: $($r.storageFinding)" }
+        }
+        foreach ($r in @(Q @('compute-optimizer', 'get-ec2-instance-recommendations', '--query', 'instanceRecommendations[*].{Arn:instanceArn,F:finding,T:recommendationOptions[0].instanceType}'))) {
+            if ($r.F -and $r.F -ne 'Optimized') { AddRec $r.Arn "CO: $($r.F)$(if ($r.T) { " -> $($r.T)" })" }
+        }
+    }
+
+    # ---- lookups
+    $clStype = @{}; $clRole = @{}
+    foreach ($c in $clusters) {
+        $clStype[$c.Id] = if ($c.StorageType) { $c.StorageType } else { 'aurora' }
+        foreach ($m in @($c.Members)) { $clRole[$m.Id] = if ($m.W) { 'Writer' } else { 'Reader' } }
+    }
+    $snapCnt = @{}; $snapGb = @{}
+    foreach ($s in $snapI) { $snapCnt[$s.Id] = 1 + [int]$snapCnt[$s.Id]; $snapGb[$s.Id] = [int]$s.Size + [int]$snapGb[$s.Id] }
+    foreach ($s in $snapC) { $snapCnt[$s.Id] = 1 + [int]$snapCnt[$s.Id] }
+    $volBy = @{}
+    foreach ($v in $vols) { if ($v.Inst) { if (-not $volBy.ContainsKey($v.Inst)) { $volBy[$v.Inst] = @() }; $volBy[$v.Inst] += $v } }
+
+    # ---- RDS / Aurora instances
+    foreach ($i in $instances) {
+        $aurora = $i.Engine -like 'aurora*'
+        $role = if ($i.Replica) { "Replica of $($i.Replica)" } elseif ($i.Cluster) { $clRole[$i.Id] } else { 'Standalone' }
+        $mk = "rds:$($i.Id)"
+        $f = @()
+        if ($i.Enc -eq $false) { $f += 'NOENC' }
+        if ($i.Public -eq $true) { $f += 'PUBLIC' }
+        if ($i.Backup -eq 0 -and -not $i.Replica) { $f += 'NO-BACKUP' }
+        if ($i.DelProt -eq $false) { $f += 'NO-DELPROT' }
+        if (-not $aurora -and $i.MultiAZ -eq $false -and -not $i.Replica) { $f += 'SINGLE-AZ' }
+        if ($i.StorageType -eq 'gp2') { $f += 'GP2' }
+        if ($i.Status -eq 'stopped') { $f += 'STOPPED' }
+        if ($i.CA -eq 'rds-ca-2019') { $f += 'OLD-CA' }
+        if ($met.ContainsKey($mk) -and $met[$mk].Conn -eq 0 -and $met[$mk].Cpu -lt 5) { $f += 'IDLE' }
+        AddRow $(if ($aurora) { 'Aurora Instance' } else { 'RDS Instance' }) $i.Id $i.Status "$($i.Engine) $($i.Ver)" $i.Class $i.Endpoint @{
+            StorageType = if ($aurora) { $clStype[$i.Cluster] } else { $i.StorageType }
+            StorageGB = if ($aurora) { $null } else { $i.Alloc }
+            Iops = $i.Iops; Throughput = $i.Thru; MaxStorageGB = $i.MaxAlloc
+            Role = $role; MultiAZ = Fv $i.MultiAZ; AZ = $i.AZ
+            Encrypted = Fv $i.Enc; Public = Fv $i.Public; DelProtect = Fv $i.DelProt; IamAuth = Fv $i.IamAuth; CACert = $i.CA
+            Created = Fd $i.Created; BackupDays = $i.Backup; AutoMinor = Fv $i.AutoMinor; MaintWindow = $i.Maint; ParamGroup = $i.PG; PerfInsights = Fv $i.PI
+            Monitoring = Ftag $i.Tags 'SSG-MONITORING'; Tags = Ftags $i.Tags
+            Snapshots = $snapCnt[$i.Id]; SnapshotGB = $snapGb[$i.Id]
+            CPU14d = $met[$mk].Cpu; ConnMax14d = $met[$mk].Conn
+            Pending = $pending[$i.Id]
+            AWSRecs = Frec $i.Id
+            Flags = Flg $f
+        }
+    }
+
+    # ---- Aurora clusters
+    foreach ($c in $clusters) {
+        $w = @($c.Members | Where-Object { $_.W }).Count; $rd = @($c.Members).Count - $w
+        $f = @()
+        if ($c.Enc -eq $false) { $f += 'NOENC' }
+        if ($c.Backup -eq 0) { $f += 'NO-BACKUP' }
+        if ($c.DelProt -eq $false) { $f += 'NO-DELPROT' }
+        AddRow 'Aurora Cluster' $c.Id $c.Status "$($c.Engine) $($c.Ver)" '-' $c.Endpoint @{
+            StorageType = $clStype[$c.Id]
+            Role = "${w}W/${rd}R"; MultiAZ = Fv $c.MultiAZ
+            Encrypted = Fv $c.Enc; DelProtect = Fv $c.DelProt; IamAuth = Fv $c.IamAuth
+            Created = Fd $c.Created; BackupDays = $c.Backup; AutoMinor = Fv $c.AutoMinor; MaintWindow = $c.Maint; ParamGroup = $c.PG
+            Capacity = if ($c.Sls) { "Serverless v2 $($c.Sls.MinCapacity)-$($c.Sls.MaxCapacity) ACU" }
+            Monitoring = Ftag $c.Tags 'SSG-MONITORING'; Tags = Ftags $c.Tags
+            Snapshots = $snapCnt[$c.Id]
+            Pending = $pending[$c.Id]
+            AWSRecs = Frec $c.Id
+            Flags = Flg $f
+        }
+    }
+
+    # ---- Blue/Green
+    foreach ($b in $bgd) {
+        AddRow 'Blue/Green' $b.Name $b.Status '-' '-' '-' @{
+            BGSource = Fid $b.Source; BGTarget = Fid $b.Target; Created = Fd $b.Created
+            Monitoring = Ftag $b.Tags 'SSG-MONITORING'; Tags = Ftags $b.Tags
+        }
+    }
+
+    # ---- EC2
+    foreach ($e in $ec2) {
+        $nameTag = Ftag $e.Tags 'Name'
+        $v = if ($volBy.ContainsKey($e.Id)) { @($volBy[$e.Id]) } else { @() }
+        $mk = "ec2:$($e.Id)"
+        $f = @()
+        if ($e.PubIp) { $f += 'PUBLIC-IP' }
+        if ($e.State -eq 'stopped') { $f += 'STOPPED' }
+        if ($v.Count -and @($v | Where-Object { -not $_.Enc }).Count) { $f += 'UNENC-VOL' }
+        if ($v.Count -and @($v | Where-Object { $_.Type -eq 'gp2' }).Count) { $f += 'GP2' }
+        if ($met.ContainsKey($mk) -and $met[$mk].Cpu -lt 2) { $f += 'IDLE' }
+        AddRow 'EC2' $(if ($nameTag) { $nameTag } else { $e.Id }) $e.State $e.Type '-' $(if ($e.Ip) { $e.Ip } else { '-' }) @{
+            StorageType = if ($v.Count) { (@($v | ForEach-Object { $_.Type } | Select-Object -Unique) -join '/') }
+            StorageGB = if ($v.Count) { (@($v | ForEach-Object { [int]$_.Size }) | Measure-Object -Sum).Sum }
+            Iops = if ($v.Count) { (@($v | ForEach-Object { [int]$_.Iops }) | Measure-Object -Sum).Sum }
+            Throughput = if ($v.Count) { (@($v | ForEach-Object { [int]$_.Thru }) | Measure-Object -Sum).Sum }
+            AZ = $e.Az
+            Encrypted = if ($v.Count) { if (@($v | Where-Object { -not $_.Enc }).Count) { 'No' } else { 'Yes' } }
+            Public = if ($e.PubIp) { 'Yes' } else { 'No' }
+            Created = Fd $e.Launch; AMI = $e.Ami; IamProfile = if ($e.Iam) { Fid $e.Iam }
+            Monitoring = Ftag $e.Tags 'SSG-MONITORING'; Tags = Ftags $e.Tags
+            CPU14d = $met[$mk].Cpu
+            AWSRecs = Frec $e.Id
+            Flags = Flg $f
+        }
+    }
+
+    # ---- waste finder
+    if ($opt.Hygiene) {
+        foreach ($v in $vols) {
+            if ($v.State -eq 'available') { AddRow 'EBS Unattached' "$($v.Id) ($($v.Type), $($v.Size) GB)" $v.State '-' $v.Type '-' @{ StorageType = $v.Type; StorageGB = $v.Size; Iops = $v.Iops; Throughput = $v.Thru; Encrypted = Fv $v.Enc } }
+        }
+        foreach ($a in @(Q @('ec2', 'describe-addresses', '--query', 'Addresses[*].{Ip:PublicIp,Assoc:AssociationId}'))) {
+            if (-not $a.Assoc) { AddRow 'Elastic IP Unused' $a.Ip 'unassociated' '-' '-' $a.Ip }
+        }
+        $liveI = @{}; foreach ($i in $instances) { $liveI[$i.Id] = $true }
+        $liveC = @{}; foreach ($c in $clusters)  { $liveC[$c.Id] = $true }
+        $orI = @($snapI | Where-Object { -not $liveI.ContainsKey($_.Id) })
+        $orC = @($snapC | Where-Object { -not $liveC.ContainsKey($_.Id) })
+        if ($orI.Count + $orC.Count -gt 0) {
+            $gb = (@($orI | ForEach-Object { [int]$_.Size }) | Measure-Object -Sum).Sum
+            AddRow 'Orphan Snapshots' "$($orI.Count) instance + $($orC.Count) cluster manual snapshot(s) of deleted DBs" 'manual' '-' '-' '-' @{ Snapshots = $orI.Count + $orC.Count; SnapshotGB = $gb; StorageGB = $gb }
+        }
+    }
+
+    # ---- other services
+    if ($opt.Other) {
+        foreach ($p in @(Q @('rds', 'describe-db-proxies', '--query', 'DBProxies[*].{Id:DBProxyName,Status:Status,Engine:EngineFamily,Endpoint:Endpoint}'))) {
+            AddRow 'RDS Proxy' $p.Id $p.Status $p.Engine '-' $p.Endpoint
+        }
+        foreach ($c in @(Q @('elasticache', 'describe-cache-clusters', '--query', 'CacheClusters[*].{Id:CacheClusterId,Status:CacheClusterStatus,Engine:Engine,Ver:EngineVersion,Type:CacheNodeType,Nodes:NumCacheNodes}'))) {
+            AddRow 'ElastiCache' $c.Id $c.Status "$($c.Engine) $($c.Ver)" $c.Type '-' @{ Capacity = "$($c.Nodes) node(s)" }
+        }
+        $names = @(Q @('opensearch', 'list-domain-names', '--query', 'DomainNames[*].DomainName'))
+        if ($names.Count) {
+            foreach ($d in @(Q (@('opensearch', 'describe-domains', '--domain-names') + $names + @('--query', 'DomainStatusList[*].{Id:DomainName,Ver:EngineVersion,Type:ClusterConfig.InstanceType,N:ClusterConfig.InstanceCount,VT:EBSOptions.VolumeType,VS:EBSOptions.VolumeSize,Ep:Endpoint,Proc:Processing}'))) ) {
+                AddRow 'OpenSearch' $d.Id $(if ($d.Proc) { 'processing' } else { 'active' }) $d.Ver $d.Type $d.Ep @{ Capacity = "$($d.N) node(s)"; StorageType = $d.VT; StorageGB = $d.VS }
+            }
+        }
+    }
+
+    # ---- last month's bill (once per profile, region-independent)
+    if ($opt.Cost -and $unit.First) {
+        $m1 = (Get-Date -Day 1).Date; $m0 = $m1.AddMonths(-1)
+        $tmp = [System.IO.Path]::GetTempFileName()
+        try {
+            [System.IO.File]::WriteAllText($tmp, '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Relational Database Service","Amazon Elastic Compute Cloud - Compute","EC2 - Other"]}}')
+            $ce = Q @('ce', 'get-cost-and-usage', '--time-period', "Start=$($m0.ToString('yyyy-MM-dd')),End=$($m1.ToString('yyyy-MM-dd'))", '--granularity', 'MONTHLY', '--metrics', 'UnblendedCost', '--group-by', 'Type=DIMENSION,Key=SERVICE', '--filter', "file://$tmp", '--query', 'ResultsByTime[0].Groups[*].{Svc:Keys[0],Cost:Metrics.UnblendedCost.Amount}')
+        } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+        foreach ($c in @($ce)) { AddRow 'Cost' $c.Svc $m0.ToString('yyyy-MM') '-' '-' '-' @{ CostUSD = [math]::Round([double]$c.Cost, 2) } }
+    }
+
+    return [PSCustomObject]@{ Rows = $rows; Errors = $errs }
+}
+
+function Select-InventoryModules {
+    # Returns a hashtable of enabled module keys (empty = standard scan), or $null when cancelled.
+    $mods = $script:InventoryModules
+    $opts = @("[ALL]  every option below except Multi-region and Cost")
+    foreach ($m in $mods) { $opts += ("{0,-20} {1}" -f $m.Label, $m.Desc) }
+
+    $sel = Show-Menu -Title "Inventory scan — SPACE = add to scan, ENTER = start (nothing selected = standard scan)" -Options $opts -MultiSelect
+    if ($sel -is [int]) { return $null }
+
+    $opt = @{}
+    $all = @($sel) -contains 0
+    for ($i = 0; $i -lt $mods.Count; $i++) {
+        if (@($sel) -contains ($i + 1) -or ($all -and -not $mods[$i].Heavy)) { $opt[$mods[$i].Key] = $true }
+    }
+    return $opt
+}
+
 function Show-ClientInventory {
     $configData = if ($global:AWSConfigDataCache) { $global:AWSConfigDataCache } else { Get-AWSConfigData }
     $sessions = @($configData.Sessions.Keys | Sort-Object)
@@ -6036,189 +6438,77 @@ function Show-ClientInventory {
     $sessionName  = $sessions[$idx]
     $profiles     = @($configData.Sessions[$sessionName] | Sort-Object)
 
+    if ($profiles.Count -gt 1) {
+        $psel = Show-Menu -Title "$sessionName — SPACE = scan only selected profiles, ENTER = start (nothing selected = all $($profiles.Count))" -Options $profiles -MultiSelect
+        if ($psel -is [int]) { return }
+        if (@($psel).Count -gt 0) { $profiles = @(@($psel) | ForEach-Object { $profiles[$_] }) }
+    }
+
+    $opt = Select-InventoryModules
+    if ($null -eq $opt) { return }
+
+    # Regions: $null = profile default region (original behaviour)
+    $regions = @($null)
+    if ($opt.Regions) {
+        $in = (Read-Host "Regions, comma-separated (e.g. eu-west-1,us-east-1), 'all' = every enabled region, Enter = profile default").Trim()
+        if ($in -eq 'all') {
+            $list = (aws ec2 describe-regions --profile $profiles[0] --query "Regions[*].RegionName" --output text 2>$null) -split '\s+' | Where-Object { $_ }
+            if ($list) { $regions = @($list) } else { Write-Host "  Could not list regions — using profile default." -ForegroundColor Yellow }
+        } elseif ($in) {
+            $regions = @($in -split '[,\s]+' | Where-Object { $_ -match '^[a-z]{2}(-[a-z]+)+-\d$' })
+            if (-not $regions) { Write-Host "  No valid region names — using profile default." -ForegroundColor Yellow; $regions = @($null) }
+        }
+    }
+
+    $units = foreach ($p in $profiles) {
+        $first = $true
+        foreach ($r in $regions) { @{ Profile = $p; Region = $r; First = $first }; $first = $false }
+    }
+    $units = @($units)
+
+    $active = @($script:InventoryModules | Where-Object { $opt[$_.Key] } | ForEach-Object { $_.Label })
     Clear-Host
     Write-Host ""
     Write-Host "  Client Resource Inventory: $sessionName" -ForegroundColor Cyan
-    Write-Host "  Scanning $($profiles.Count) profile(s) — RDS, Aurora, Blue/Green, EC2" -ForegroundColor Gray
+    Write-Host "  Scanning $($profiles.Count) profile(s) x $($regions.Count) region(s) — RDS, Aurora, Blue/Green, EC2" -ForegroundColor Gray
+    if ($active) { Write-Host "  + $($active -join ', ')" -ForegroundColor Gray }
     Write-Host ""
 
-    $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
-
+    $results = @()
     if ($PSVersionTable.PSVersion.Major -ge 7) {
-        # PS7+: scan profiles in parallel (up to 5 at a time); each profile returns its own row list
-        $allParallelRows = $profiles | ForEach-Object -Parallel {
-            $prof = $_
-            $localRows = [System.Collections.Generic.List[PSCustomObject]]::new()
-
-            # RDS instances (includes Aurora instances)
-            try {
-                $raw = (aws rds describe-db-instances --profile $prof --query "DBInstances[*].{DBInstanceIdentifier:DBInstanceIdentifier,Engine:Engine,EngineVersion:EngineVersion,DBInstanceStatus:DBInstanceStatus,DBInstanceClass:DBInstanceClass,Endpoint:Endpoint}" --output json 2>$null) -join ""
-                if ($LASTEXITCODE -eq 0 -and $raw) {
-                    ($raw | ConvertFrom-Json) | ForEach-Object {
-                        $type = if ($_.Engine -like "aurora*") { "Aurora Instance" } else { "RDS Instance" }
-                        $localRows.Add([PSCustomObject]@{
-                            Profile  = $prof
-                            Type     = $type
-                            Name     = $_.DBInstanceIdentifier
-                            Status   = $_.DBInstanceStatus
-                            Engine   = "$($_.Engine) $($_.EngineVersion)"
-                            Class    = $_.DBInstanceClass
-                            Endpoint = if ($_.Endpoint) { $_.Endpoint.Address } else { "-" }
-                        })
-                    }
-                }
-            } catch {}
-
-            # Aurora clusters
-            try {
-                $raw = (aws rds describe-db-clusters --profile $prof --query "DBClusters[*].{DBClusterIdentifier:DBClusterIdentifier,Status:Status,Engine:Engine,EngineVersion:EngineVersion,Endpoint:Endpoint}" --output json 2>$null) -join ""
-                if ($LASTEXITCODE -eq 0 -and $raw) {
-                    ($raw | ConvertFrom-Json) | ForEach-Object {
-                        $localRows.Add([PSCustomObject]@{
-                            Profile  = $prof
-                            Type     = "Aurora Cluster"
-                            Name     = $_.DBClusterIdentifier
-                            Status   = $_.Status
-                            Engine   = "$($_.Engine) $($_.EngineVersion)"
-                            Class    = "-"
-                            Endpoint = if ($_.Endpoint) { $_.Endpoint } else { "-" }
-                        })
-                    }
-                }
-            } catch {}
-
-            # Blue/Green deployments
-            try {
-                $raw = (aws rds describe-blue-green-deployments --profile $prof 2>$null) -join ""
-                if ($LASTEXITCODE -eq 0 -and $raw) {
-                    ($raw | ConvertFrom-Json).BlueGreenDeployments | ForEach-Object {
-                        $localRows.Add([PSCustomObject]@{
-                            Profile  = $prof
-                            Type     = "Blue/Green"
-                            Name     = $_.BlueGreenDeploymentName
-                            Status   = $_.Status
-                            Engine   = "-"
-                            Class    = "-"
-                            Endpoint = "-"
-                        })
-                    }
-                }
-            } catch {}
-
-            # EC2 instances (skip terminated)
-            try {
-                $raw = (aws ec2 describe-instances --profile $prof --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" --query "Reservations[].Instances[].{InstanceId:InstanceId,State:State,InstanceType:InstanceType,PrivateIpAddress:PrivateIpAddress,Tags:Tags}" --output json 2>$null) -join ""
-                if ($LASTEXITCODE -eq 0 -and $raw) {
-                    ($raw | ConvertFrom-Json) | ForEach-Object {
-                        $nameTag = ($_.Tags | Where-Object { $_.Key -eq "Name" } | Select-Object -First 1).Value
-                        $localRows.Add([PSCustomObject]@{
-                            Profile  = $prof
-                            Type     = "EC2"
-                            Name     = if ($nameTag) { $nameTag } else { $_.InstanceId }
-                            Status   = $_.State.Name
-                            Engine   = $_.InstanceType
-                            Class    = "-"
-                            Endpoint = if ($_.PrivateIpAddress) { $_.PrivateIpAddress } else { "-" }
-                        })
-                    }
-                }
-            } catch {}
-
-            return $localRows
-        } -ThrottleLimit 5
-
-        foreach ($profileRows in $allParallelRows) {
-            foreach ($r in $profileRows) { $rows.Add($r) }
-        }
-        Write-Host "  Parallel scan complete — $($rows.Count) resource(s) across $($profiles.Count) profile(s)" -ForegroundColor DarkGray
+        # PS7+: scan units in parallel (up to 5 at a time); scriptblocks can't cross runspaces via $using, so pass the text
+        $scanText = $script:InventoryScanBlock.ToString()
+        $results = @($units | ForEach-Object -Parallel {
+            $sb = [scriptblock]::Create($using:scanText)
+            & $sb $_ $using:opt
+        } -ThrottleLimit 5)
     } else {
-        # PS5.1 fallback: sequential scan
         $i = 0
-        foreach ($prof in $profiles) {
+        foreach ($u in $units) {
             $i++
-            Write-Host "  [$i/$($profiles.Count)] $prof" -ForegroundColor DarkGray -NoNewline
-            $found = 0
+            $label = if ($u.Region) { "$($u.Profile)/$($u.Region)" } else { $u.Profile }
+            Write-Host "  [$i/$($units.Count)] $label" -ForegroundColor DarkGray -NoNewline
+            $res = & $script:InventoryScanBlock $u $opt
+            $results += $res
+            $countColor = if ($res.Rows.Count -gt 0) { "Green" } else { "DarkGray" }
+            Write-Host "  $($res.Rows.Count) resource(s)" -ForegroundColor $countColor
+        }
+    }
 
-            # RDS instances (includes Aurora instances)
-            try {
-                $raw = (aws rds describe-db-instances --profile $prof --query "DBInstances[*].{DBInstanceIdentifier:DBInstanceIdentifier,Engine:Engine,EngineVersion:EngineVersion,DBInstanceStatus:DBInstanceStatus,DBInstanceClass:DBInstanceClass,Endpoint:Endpoint}" --output json 2>$null) -join ""
-                if ($LASTEXITCODE -eq 0 -and $raw) {
-                    ($raw | ConvertFrom-Json) | ForEach-Object {
-                        $type = if ($_.Engine -like "aurora*") { "Aurora Instance" } else { "RDS Instance" }
-                        $rows.Add([PSCustomObject]@{
-                            Profile  = $prof
-                            Type     = $type
-                            Name     = $_.DBInstanceIdentifier
-                            Status   = $_.DBInstanceStatus
-                            Engine   = "$($_.Engine) $($_.EngineVersion)"
-                            Class    = $_.DBInstanceClass
-                            Endpoint = if ($_.Endpoint) { $_.Endpoint.Address } else { "-" }
-                        })
-                        $found++
-                    }
-                }
-            } catch {}
-
-            # Aurora clusters
-            try {
-                $raw = (aws rds describe-db-clusters --profile $prof --query "DBClusters[*].{DBClusterIdentifier:DBClusterIdentifier,Status:Status,Engine:Engine,EngineVersion:EngineVersion,Endpoint:Endpoint}" --output json 2>$null) -join ""
-                if ($LASTEXITCODE -eq 0 -and $raw) {
-                    ($raw | ConvertFrom-Json) | ForEach-Object {
-                        $rows.Add([PSCustomObject]@{
-                            Profile  = $prof
-                            Type     = "Aurora Cluster"
-                            Name     = $_.DBClusterIdentifier
-                            Status   = $_.Status
-                            Engine   = "$($_.Engine) $($_.EngineVersion)"
-                            Class    = "-"
-                            Endpoint = if ($_.Endpoint) { $_.Endpoint } else { "-" }
-                        })
-                        $found++
-                    }
-                }
-            } catch {}
-
-            # Blue/Green deployments
-            try {
-                $raw = (aws rds describe-blue-green-deployments --profile $prof 2>$null) -join ""
-                if ($LASTEXITCODE -eq 0 -and $raw) {
-                    ($raw | ConvertFrom-Json).BlueGreenDeployments | ForEach-Object {
-                        $rows.Add([PSCustomObject]@{
-                            Profile  = $prof
-                            Type     = "Blue/Green"
-                            Name     = $_.BlueGreenDeploymentName
-                            Status   = $_.Status
-                            Engine   = "-"
-                            Class    = "-"
-                            Endpoint = "-"
-                        })
-                        $found++
-                    }
-                }
-            } catch {}
-
-            # EC2 instances (skip terminated)
-            try {
-                $raw = (aws ec2 describe-instances --profile $prof --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" --query "Reservations[].Instances[].{InstanceId:InstanceId,State:State,InstanceType:InstanceType,PrivateIpAddress:PrivateIpAddress,Tags:Tags}" --output json 2>$null) -join ""
-                if ($LASTEXITCODE -eq 0 -and $raw) {
-                    ($raw | ConvertFrom-Json) | ForEach-Object {
-                        $nameTag = ($_.Tags | Where-Object { $_.Key -eq "Name" } | Select-Object -First 1).Value
-                        $rows.Add([PSCustomObject]@{
-                            Profile  = $prof
-                            Type     = "EC2"
-                            Name     = if ($nameTag) { $nameTag } else { $_.InstanceId }
-                            Status   = $_.State.Name
-                            Engine   = $_.InstanceType
-                            Class    = "-"
-                            Endpoint = if ($_.PrivateIpAddress) { $_.PrivateIpAddress } else { "-" }
-                        })
-                        $found++
-                    }
-                }
-            } catch {}
-
-            $countColor = if ($found -gt 0) { "Green" } else { "DarkGray" }
-            Write-Host "  $found resource(s)" -ForegroundColor $countColor
+    # Normalize: one fixed column set (core 7 + columns of selected modules), '-' for blanks
+    $selMods = @($script:InventoryModules | Where-Object { $opt[$_.Key] })
+    $cols = @('Profile') + @($selMods | Where-Object { $_.Prefix } | ForEach-Object { $_.Columns }) +
+            @('Type', 'Name', 'Status', 'Engine', 'Class', 'Endpoint') +
+            @($selMods | Where-Object { -not $_.Prefix } | ForEach-Object { $_.Columns })
+    $rows = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($res in $results) {
+        foreach ($r in $res.Rows) {
+            $o = [ordered]@{}
+            foreach ($c in $cols) {
+                $v = $r.$c
+                $o[$c] = if ($null -eq $v -or "$v" -eq '') { '-' } else { $v }
+            }
+            $rows.Add([PSCustomObject]$o)
         }
     }
 
@@ -6228,13 +6518,67 @@ function Show-ClientInventory {
 
     if ($rows.Count -eq 0) {
         Write-Host "  No resources found. Check that SSO tokens are valid for this client." -ForegroundColor Yellow
-        Read-Host "Press Enter to menu..."
-        return
+    } else {
+        $sortKeys = @('Profile') + @(if ($cols -contains 'Region') { 'Region' }) + @('Type', 'Name')
+        $sorted = @($rows | Sort-Object $sortKeys)
+        if ($selMods.Count -eq 0) {
+            $sorted | Format-Table -AutoSize | Out-Host
+        } else {
+            # wide data: one table per resource type, hiding columns empty for that type and splitting
+            # the rest into chunks that fit the console width (key columns repeated in every chunk)
+            $maxW = 0
+            try { $maxW = $Host.UI.RawUI.WindowSize.Width } catch {}
+            if ($maxW -lt 60) { $maxW = 120 }
+            $keys = @('Profile') + @($selMods | Where-Object { $_.Prefix } | ForEach-Object { $_.Columns }) + @('Name')
+            foreach ($g in ($sorted | Group-Object Type)) {
+                Write-Host "  $($g.Name) ($($g.Count))" -ForegroundColor Yellow
+                $width = @{}
+                foreach ($c in $cols) {
+                    $width[$c] = 1 + (@($c.Length) + @($g.Group | ForEach-Object { "$($_.$c)".Length }) | Measure-Object -Maximum).Maximum
+                }
+                $rest = @($cols | Where-Object { $c = $_; $c -ne 'Type' -and $c -notin $keys -and @($g.Group | Where-Object { "$($_.$c)" -ne '-' }).Count -gt 0 })
+                $keyW  = ($keys | ForEach-Object { $width[$_] } | Measure-Object -Sum).Sum
+                $chunk = @(); $cur = $keyW
+                foreach ($c in $rest) {
+                    if ($chunk.Count -gt 0 -and $cur + $width[$c] -gt $maxW - 2) {
+                        $g.Group | Format-Table -Property ($keys + $chunk) -AutoSize | Out-Host
+                        $chunk = @(); $cur = $keyW
+                    }
+                    $chunk += $c; $cur += $width[$c]
+                }
+                $g.Group | Format-Table -Property ($keys + $chunk) -AutoSize | Out-Host
+            }
+        }
+
+        if ($opt.Summary) {
+            Write-Host "  Summary per type" -ForegroundColor Yellow
+            $sorted | Group-Object Type | ForEach-Object {
+                $o = [ordered]@{ Type = $_.Name; Count = $_.Count }
+                if ($cols -contains 'StorageGB') { $o.StorageGB = [int](@($_.Group | Where-Object { "$($_.StorageGB)" -ne '-' } | ForEach-Object { [double]$_.StorageGB }) | Measure-Object -Sum).Sum }
+                [PSCustomObject]$o
+            } | Format-Table -AutoSize | Out-Host
+            Write-Host "  Summary per profile" -ForegroundColor Yellow
+            $sorted | Group-Object Profile | ForEach-Object { [PSCustomObject]@{ Profile = $_.Name; Resources = $_.Count } } | Format-Table -AutoSize | Out-Host
+        }
     }
 
-    $sorted = $rows | Sort-Object Profile, Type, Name
-    $sorted | Format-Table -AutoSize | Out-Host
+    if ($opt.Errors) {
+        $errList = @($results | ForEach-Object { $_.Errors } | Sort-Object -Unique)
+        if ($errList.Count -eq 0) {
+            Write-Host "  Scan problems: none" -ForegroundColor Green
+        } else {
+            Write-Host "  Scan problems — these calls returned nothing:" -ForegroundColor Red
+            $errList | ForEach-Object {
+                if ($_ -match '^(\S+) \[(.+?)\]: (.*)$') { [PSCustomObject]@{ Tag = $Matches[1]; Call = $Matches[2]; Msg = ($Matches[3] -replace ' when calling the .*? operation', '') } }
+            } | Group-Object Tag, Msg | ForEach-Object {
+                Write-Host "    $($_.Group[0].Tag): $($_.Count) call(s) failed — $($_.Group[0].Msg)" -ForegroundColor DarkYellow
+                Write-Host "      $(($_.Group | ForEach-Object { $_.Call }) -join ', ')" -ForegroundColor DarkGray
+            }
+        }
+        Write-Host ""
+    }
 
+    if ($rows.Count -eq 0) { Read-Host "Press Enter to menu..."; return }
     Export-Report -Data $sorted -DefaultFileName "inventory_${sessionName}_$(Get-TimeStamp)"
 }
 
@@ -6363,7 +6707,6 @@ if ($MyInvocation.InvocationName -ne '.') {
                 "RDS Management",
                 "EC2 Management",
                 "Client Resource Inventory",
-                "AWS Sessions (Assume/Granted)",
                 "Quit"
             )
 
@@ -6375,8 +6718,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                 0 { Show-RDS-Menu }
                 1 { Show-EC2-Menu }
                 2 { Show-ClientInventory }
-                3 { Show-AWSSessions-Menu }
-                4 {
+                3 {
                     # Restore cursor before exit
                     try { [Console]::CursorVisible = $true } catch {}
                     Clear-Host
