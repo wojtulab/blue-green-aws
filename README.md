@@ -26,6 +26,7 @@ Interactive PowerShell tool for managing AWS RDS instances, Blue/Green deploymen
 | **Delete Blue/Green Deployment** | Pre-deletion replica lag check, auto-disable deletion protection |
 | **Upgrade Database Engine** | Guided version upgrade workflow |
 | **Update OS** | Batch system-update application with safeguards |
+| **Notifications & Tracker** | Desktop Toast & sound alert on `AVAILABLE`/`FAILED`; isolated tracking of user deployments with auto-retention |
 
 ### Snapshots
 
@@ -48,6 +49,8 @@ Interactive PowerShell tool for managing AWS RDS instances, Blue/Green deploymen
 | **Pending OS Upgrade** | Instances with pending maintenance |
 | **DB All Details / Versions** | Cross-instance engine comparison |
 | **Recommendation List** | AWS Compute Optimizer findings |
+| **Storage Health** | CloudWatch storage metrics with Used% and color-coded thresholds |
+| **Snapshot Retention Audit** | Manual snapshot age distribution and quota audit |
 
 All reports support **CSV/HTML export**.
 
@@ -58,8 +61,7 @@ Basic EC2 instance operations: select, start, stop, create/remove snapshots, and
 ### AWS Sessions
 
 - **IAM Identity Center (SSO)** authentication flow
-- **Cross-account role profiles** (`source_profile` chaining) — automatically resolves the root SSO profile for login (e.g. `VESA_BOOMI → veolia`)
-- **Assume Role / Granted** session management
+- **Cross-account role profiles** (`source_profile` chaining) — automatically resolves the root SSO profile for login (e.g. `child-role-profile → root-sso-profile`)
 - Automatic SSO token refresh on expiration — streams the verification URL live and opens the default browser; URL is also visible in the terminal for copy/paste into incognito
 - Color-coded profiles by environment: 🟢 Read-Only | 🟠 Non-Prod RW | 🔴 Prod RW
 
@@ -147,6 +149,11 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 ### 6. Run the script
 
+**Quick Start (Windows):**
+Simply double-click **`rds_bg_manager.bat`**. It will automatically unblock files, bypass the execution policy, and launch using PowerShell 7 (or fallback to Windows PowerShell 5.1).
+
+**Or run manually in PowerShell:**
+
 ```powershell
 # Open PowerShell 7 (pwsh) and navigate to the script folder:
 cd C:\Tools\rds-manager
@@ -155,7 +162,7 @@ cd C:\Tools\rds-manager
 pwsh .\rds_bg_manager.ps1
 ```
 
-If you still get a policy error, you can bypass it for a single run:
+If you get a policy error in manual mode, you can bypass it:
 
 ```powershell
 pwsh -ExecutionPolicy Bypass -File .\rds_bg_manager.ps1
@@ -254,9 +261,12 @@ External config file: **`rds_bg_manager.config.ps1`** (same directory as the scr
 ## Architecture
 
 ```
-rds_bg_manager.ps1          Main script (~5100 lines)
+rds_bg_manager.bat          Windows launcher (auto-unblock, bypass policy)
+rds_bg_manager.ps1          Main script
 rds_bg_manager.config.ps1   External configuration (optional)
-rds_manager_YYYYMMDD.log    Daily log file (auto-created)
+rds_bg_notifications.json   Notifications & tracking config (auto-created)
+logs/rds_manager_YYYYMMDD.log    Daily log file (auto-created)
+logs/tracked_deployments.json    Deployment tracker state (auto-created)
 ```
 
 ### Key Technical Details
@@ -273,7 +283,7 @@ rds_manager_YYYYMMDD.log    Daily log file (auto-created)
 
 ## Logging
 
-All operations are logged to daily files (`rds_manager_YYYYMMDD.log`) in the script directory. Log entries include timestamps and are written via the `Write-Log` function which outputs to both console and file.
+All operations are logged to daily files (`rds_manager_YYYYMMDD.log`) in the `logs` folder next to the script. Log entries include timestamps and are written via the `Write-Log` function which outputs to both console and file.
 
 ---
 
