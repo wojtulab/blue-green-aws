@@ -1,4 +1,4 @@
-# VERSION: 2026.10.09.04
+# VERSION: 2026.10.16.02
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -9,6 +9,17 @@
     Wojciech Kuncewicz DBA
 
 .CHANGELOG
+    2026-10-16
+    - FEATURE: Blue/Green Deployment Notifications & Tracker:
+      * Desktop Toast notification (Windows Toast / Linux notify-send) and sound chime when deployment reaches AVAILABLE (ready for switchover) or FAILED.
+      * Isolated tracking of ONLY user-created deployments in local state file (`tracked_deployments.json`), ignoring other concurrent AWS deployments.
+      * External configuration file `rds_bg_notifications.json` with dedicated TUI settings menu (`Show-NotificationSettings-Menu`).
+      * Auto-track option (ALWAYS notify without asking / ASK / DISABLED) configurable per user.
+      * Background checking while idle in any menu and integrated readiness alert in `Monitor-BGStatus-Interactive`.
+    - FEATURE: 'Create Blue/Green Deployment' UI enhancements:
+      * Target Engine Version: Minor upgrades highlighted in Green, Major upgrades highlighted in Yellow (less safe), 'Keep Current' highlighted in Cyan and pre-selected by default (toggable with SPACE).
+      * Parameter Group: Shows current instance Parameter Group in title, exact-match current PG highlighted in Green with [CURRENT] tag, and pre-selected by default.
+      * TUI Engine: Added -InitialSelection support to Show-Menu and Invoke-InteractiveViewportSelection with multi-select semantic color preservation.
     2026-10-09
     - CHANGE: Daily log files (`rds_manager_YYYYMMDD.log`) now go to a `logs` folder next to the script (created on startup) instead of the current directory. An absolute `LogFileFormat` in the config is still honoured.
     - FEATURE: Client Resource Inventory module "AWS recommendations" (column AWSRecs): active RDS Recommendations (`rds describe-db-recommendations`) plus Compute Optimizer findings for RDS instances/storage and EC2 (non-Optimized only, with the suggested size). Compute Optimizer needs opt-in per account; if it is not enabled the failed call shows up under "Scan problems".
@@ -256,7 +267,7 @@ if (Test-Path $ConfigPath) {
         }
 
         if ($LoadedConfig -is [System.Collections.IDictionary]) {
-            $validKeys = @('WindowTitle', 'UpdateUrl', 'LogFileFormat')
+            $validKeys = @('WindowTitle', 'UpdateUrl', 'LogFileFormat', 'Notification')
             foreach ($key in $LoadedConfig.Keys) {
                 if ($key -notin $validKeys) {
                     Write-Host "Config Warning: Unknown key '$key' in config file (valid: $($validKeys -join ', '))" -ForegroundColor Yellow
@@ -288,7 +299,14 @@ if (-not [System.IO.Path]::IsPathRooted($global:LogFile)) {
     $logDir = Join-Path $PSScriptRoot "logs"
     if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
     $global:LogFile = Join-Path $logDir $global:LogFile
+} else {
+    $logDir = Split-Path -Path $global:LogFile -Parent
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 }
+$global:NotificationConfigPath = Join-Path $PSScriptRoot "rds_bg_notifications.json"
+$global:TrackedDeploymentsPath = Join-Path $logDir "tracked_deployments.json"
+$global:EnableBGWatcher = $true
+$global:LastBGWatcherCheck = Get-Date
 $global:UpdateUrl = $Global:Config.UpdateUrl
 if ($global:UpdateUrl -and $global:UpdateUrl -notmatch '^https://') {
     Write-Host "Config Warning: UpdateUrl must be an https:// URL. OTA updates disabled." -ForegroundColor Yellow
@@ -648,6 +666,500 @@ function Get-TimeStamp {
     return Get-Date -Format "yyyyMMdd-HHmm"
 }
 
+# --- NOTIFICATION & DEPLOYMENT TRACKER ---
+
+function global:Get-BGNotificationConfig {
+    $default = [ordered]@{
+        EnableDesktopToast   = $true
+        EnableSound          = $true
+        AutoTrackOnCreate    = "ALWAYS"  # ALWAYS, ASK, DISABLED
+        CheckIntervalSeconds = 60
+        RetentionDays        = 7         # 0 = disabled, >0 = auto-clean completed older than N days
+        SoundFrequency       = 800
+        SoundDurationMs      = 300
+    }
+
+    # Fallback to rds_bg_manager.config.ps1 if present
+    if ($Global:Config -and $Global:Config.Notification -is [System.Collections.IDictionary]) {
+        $nc = $Global:Config.Notification
+        if ($null -ne $nc.EnableDesktopToast)   { $default.EnableDesktopToast = [bool]$nc.EnableDesktopToast }
+        if ($null -ne $nc.EnableSound)          { $default.EnableSound = [bool]$nc.EnableSound }
+        if ($null -ne $nc.AutoTrackOnCreate)    { $default.AutoTrackOnCreate = [string]$nc.AutoTrackOnCreate }
+        if ($null -ne $nc.CheckIntervalSeconds) { $default.CheckIntervalSeconds = [int]$nc.CheckIntervalSeconds }
+        if ($null -ne $nc.RetentionDays)        { $default.RetentionDays = [int]$nc.RetentionDays }
+    }
+
+    # Dedicated JSON config file has highest priority (and is updated by UI menu)
+    if (Test-Path $global:NotificationConfigPath) {
+        try {
+            $content = Get-Content -Path $global:NotificationConfigPath -Raw -ErrorAction SilentlyContinue
+            if (![string]::IsNullOrWhiteSpace($content)) {
+                $json = $content | ConvertFrom-Json
+                if ($json) {
+                    if ($null -ne $json.EnableDesktopToast)   { $default.EnableDesktopToast = [bool]$json.EnableDesktopToast }
+                    if ($null -ne $json.EnableSound)          { $default.EnableSound = [bool]$json.EnableSound }
+                    if ($null -ne $json.AutoTrackOnCreate)    { $default.AutoTrackOnCreate = [string]$json.AutoTrackOnCreate }
+                    if ($null -ne $json.CheckIntervalSeconds) { $default.CheckIntervalSeconds = [int]$json.CheckIntervalSeconds }
+                    if ($null -ne $json.RetentionDays)        { $default.RetentionDays = [int]$json.RetentionDays }
+                    if ($null -ne $json.SoundFrequency)       { $default.SoundFrequency = [int]$json.SoundFrequency }
+                    if ($null -ne $json.SoundDurationMs)      { $default.SoundDurationMs = [int]$json.SoundDurationMs }
+                }
+            }
+        } catch {}
+    } else {
+        try {
+            $jsonStr = [PSCustomObject]$default | ConvertTo-Json -Depth 5
+            Set-Content -Path $global:NotificationConfigPath -Value $jsonStr -Force -ErrorAction SilentlyContinue
+        } catch {}
+    }
+
+    return [PSCustomObject]$default
+}
+
+function global:Save-BGNotificationConfig {
+    param([PSCustomObject]$Config)
+    try {
+        $jsonStr = $Config | ConvertTo-Json -Depth 5
+        Set-Content -Path $global:NotificationConfigPath -Value $jsonStr -Force
+        return $true
+    } catch {
+        Write-Log "Failed to save notification config: $_" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+function global:Get-TrackedBGDeployments {
+    if (-not (Test-Path $global:TrackedDeploymentsPath)) {
+        return @()
+    }
+    try {
+        $content = Get-Content -Path $global:TrackedDeploymentsPath -Raw -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($content)) { return @() }
+        $data = $content | ConvertFrom-Json
+        if ($data -is [System.Array]) { return $data }
+        elseif ($data) { return @($data) }
+        else { return @() }
+    } catch {
+        return @()
+    }
+}
+
+function global:Save-TrackedBGDeployments {
+    param([array]$Deployments)
+    try {
+        $parentDir = Split-Path -Path $global:TrackedDeploymentsPath -Parent
+        if ($parentDir -and -not (Test-Path $parentDir)) {
+            New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
+        }
+        $json = if ($Deployments -and $Deployments.Count -gt 0) {
+            $Deployments | ConvertTo-Json -Depth 5
+        } else {
+            "[]"
+        }
+        Set-Content -Path $global:TrackedDeploymentsPath -Value $json -Force
+        return $true
+    } catch {
+        Write-Log "Failed to save tracked deployments: $_" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+function global:Add-TrackedBGDeployment {
+    param(
+        [string]$BgId,
+        [string]$BgName,
+        [string]$SourceDB,
+        [string]$Profile,
+        [string]$TargetVersion
+    )
+    if ([string]::IsNullOrWhiteSpace($BgId)) { return }
+    $list = @(Get-TrackedBGDeployments)
+    $existing = $list | Where-Object { $_.BgId -eq $BgId }
+    if ($existing) { return $list }
+
+    $newItem = [PSCustomObject]@{
+        BgId          = $BgId
+        BgName        = $BgName
+        SourceDB      = $SourceDB
+        Profile       = $Profile
+        TargetVersion = $TargetVersion
+        CreatedAt     = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        Status        = "PROVISIONING"
+        Notified      = $false
+        CompletedAt   = $null
+    }
+    $list += $newItem
+    Save-TrackedBGDeployments -Deployments $list | Out-Null
+    Write-Log "Tracked deployment registered: $BgName ($BgId)" -ForegroundColor DarkGray
+    return $list
+}
+
+function global:Send-BGNotification {
+    param(
+        [string]$Title = "AWS RDS Blue/Green Ready",
+        [string]$Message = "Deployment is ready.",
+        [string]$Status = "AVAILABLE"
+    )
+    $cfg = Get-BGNotificationConfig
+
+    # 1. Sound Notification
+    if ($cfg.EnableSound) {
+        try {
+            if ($Status -in @("AVAILABLE", "SWITCHOVER_COMPLETED")) {
+                [System.Console]::Beep(700, 150)
+                [System.Console]::Beep(900, 150)
+                [System.Console]::Beep(1200, 300)
+            } else {
+                [System.Console]::Beep(1000, 200)
+                [System.Console]::Beep(600, 300)
+            }
+        } catch {
+            try { [System.Console]::Write([char]7) } catch {}
+        }
+    }
+
+    # 2. Desktop Toast Notification
+    if ($cfg.EnableDesktopToast) {
+        if ($IsWindows -or (-not $IsWindows -and -not $env:HOME)) {
+            # Windows Desktop Notification
+            try {
+                [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+                $templateType = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
+                $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($templateType)
+                $textNodes = $xml.GetElementsByTagName("text")
+                $textNodes[0].AppendChild($xml.CreateTextNode($Title)) | Out-Null
+                $textNodes[1].AppendChild($xml.CreateTextNode($Message)) | Out-Null
+                $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+                $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("AWS RDS BG Manager")
+                $notifier.Show($toast)
+            } catch {
+                try {
+                    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+                    $notify = New-Object System.Windows.Forms.NotifyIcon
+                    $notify.Icon = [System.Drawing.SystemIcons]::Information
+                    $notify.BalloonTipTitle = $Title
+                    $notify.BalloonTipText = $Message
+                    $notify.BalloonTipIcon = "Info"
+                    $notify.Visible = $true
+                    $notify.ShowBalloonTip(7000)
+                } catch {}
+            }
+        } else {
+            # Linux Desktop Notification (notify-send)
+            try {
+                $urgency = if ($Status -in @("AVAILABLE", "SWITCHOVER_COMPLETED")) { "normal" } else { "critical" }
+                & notify-send "$Title" "$Message" -a "RDS BG Manager" -u $urgency 2>$null
+            } catch {}
+        }
+    }
+}
+
+function global:Cleanup-TrackedBGDeployments {
+    param([int]$Days = -1)
+    $cfg = Get-BGNotificationConfig
+    $retention = if ($Days -ge 0) { $Days } else { [int]($cfg.RetentionDays ?? 7) }
+    if ($retention -le 0) { return }
+
+    $tracked = @(Get-TrackedBGDeployments)
+    if ($tracked.Count -eq 0) { return }
+
+    $cutoff = (Get-Date).AddDays(-$retention)
+    $cleaned = @()
+    $removedCount = 0
+
+    foreach ($item in $tracked) {
+        if ($item.Notified) {
+            $dateStr = if ($item.CompletedAt) { $item.CompletedAt } else { $item.CreatedAt }
+            try {
+                $dt = [DateTime]$dateStr
+                if ($dt -lt $cutoff) {
+                    $removedCount++
+                    continue
+                }
+            } catch {}
+        }
+        $cleaned += $item
+    }
+
+    if ($removedCount -gt 0) {
+        Save-TrackedBGDeployments -Deployments $cleaned | Out-Null
+        Write-Log "Auto-cleaned $removedCount completed deployment(s) older than $retention day(s)." -ForegroundColor DarkGray
+    }
+}
+
+function global:Check-TrackedBGDeployments {
+    param([switch]$Silent)
+
+    try { Cleanup-TrackedBGDeployments } catch {}
+
+    $tracked = @(Get-TrackedBGDeployments)
+    $pending = @($tracked | Where-Object { -not $_.Notified })
+    if ($pending.Count -eq 0) { return }
+
+    $updated = $false
+    foreach ($item in $pending) {
+        $bgId = $item.BgId
+        $prof = if ($item.Profile) { $item.Profile } else { $global:AWSProfile }
+        if (!$prof) { continue }
+
+        try {
+            $argsList = @("rds", "describe-blue-green-deployments", "--blue-green-deployment-identifier", $bgId, "--output", "json", "--profile", $prof)
+            $outRaw = & aws $argsList 2>$null
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($outRaw)) { continue }
+
+            $data = ($outRaw -join "") | ConvertFrom-Json
+            if (!$data.BlueGreenDeployments -or $data.BlueGreenDeployments.Count -eq 0) { continue }
+
+            $bg = $data.BlueGreenDeployments[0]
+            $newStatus = $bg.Status
+            $item.Status = $newStatus
+
+            if ($newStatus -in @("AVAILABLE", "SWITCHOVER_COMPLETED")) {
+                $item.Notified = $true
+                $item.CompletedAt = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                $updated = $true
+                Write-Log "[NOTIFICATION] Deployment '$($item.BgName)' ($($item.SourceDB)) reached $newStatus!" -ForegroundColor Green
+                Send-BGNotification -Title "RDS Blue/Green Ready ✓" -Message "Deployment '$($item.BgName)' ($($item.SourceDB)) is $newStatus and ready for switchover!" -Status $newStatus
+            } elseif ($newStatus -in @("FAILED", "SWITCHOVER_FAILED", "INVALID_CONFIGURATION")) {
+                $item.Notified = $true
+                $item.CompletedAt = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                $updated = $true
+                Write-Log "[NOTIFICATION] Deployment '$($item.BgName)' ($($item.SourceDB)) failed with status $newStatus!" -ForegroundColor Red
+                Send-BGNotification -Title "RDS Blue/Green Error ⚠" -Message "Deployment '$($item.BgName)' ($($item.SourceDB)) failed: $newStatus" -Status $newStatus
+            }
+        } catch {}
+    }
+
+    if ($updated) {
+        Save-TrackedBGDeployments -Deployments $tracked | Out-Null
+    }
+}
+
+function global:Add-ExistingBGDeployments-Interactive {
+    Show-Header
+    Write-Host "Fetching Blue/Green Deployments from AWS (Profile: $global:AWSProfile)..." -ForegroundColor Cyan
+    $awsBgs = @(Get-BlueGreenDeployments -Force)
+
+    if (!$awsBgs -or $awsBgs.Count -eq 0) {
+        Write-Host "`nNo Blue/Green deployments found in AWS account/profile: $global:AWSProfile" -ForegroundColor Yellow
+        Read-Host "`nPress Enter to return..."
+        return
+    }
+
+    $tracked = @(Get-TrackedBGDeployments)
+    $trackedIds = @($tracked | ForEach-Object { $_.BgId })
+
+    $options = @()
+    $bgMapping = @()
+
+    foreach ($bg in $awsBgs) {
+        $bgId = $bg.BlueGreenDeploymentIdentifier
+        $bgName = $bg.BlueGreenDeploymentName
+        $sourceDb = Get-InstanceIdFromArn $bg.Source
+        if ($bg.Source -match ":(db|cluster):(.+)$") { $sourceDb = $matches[2] }
+        $status = $bg.Status
+        $targetVer = if ($bg.TargetEngineVersion) { $bg.TargetEngineVersion } else { "N/A" }
+
+        $isAlready = $trackedIds -contains $bgId
+        $marker = if ($isAlready) { " [ALREADY TRACKED]" } else { "" }
+
+        $displayLine = "{0,-32} | DB: {1,-14} | Status: {2,-16} | Target: {3,-10}{4}" -f $bgName, $sourceDb, $status, $targetVer, $marker
+        $options += $displayLine
+        $bgMapping += [PSCustomObject]@{
+            BgId          = $bgId
+            BgName        = $bgName
+            SourceDB      = $sourceDb
+            Status        = $status
+            TargetVersion = $targetVer
+            IsAlready     = $isAlready
+        }
+    }
+
+    $title = "Select AWS Deployments to Track (SPACE to Toggle, ENTER to Confirm)"
+    $selectedIndices = Show-Menu -Title $title -Options $options -EnableFilter -MultiSelect
+
+    if ($selectedIndices -is [int]) {
+        if ($selectedIndices -eq -99) { $global:RestartSessionSelection = $true }
+        return
+    }
+    if (!$selectedIndices -or $selectedIndices.Count -eq 0) {
+        Write-Host "`nNo deployments selected." -ForegroundColor Yellow
+        Start-Sleep -Seconds 1
+        return
+    }
+
+    $addedCount = 0
+    $alreadyCount = 0
+    foreach ($idx in $selectedIndices) {
+        $item = $bgMapping[$idx]
+        if ($item.IsAlready) {
+            $alreadyCount++
+            continue
+        }
+
+        $newItem = [PSCustomObject]@{
+            BgId          = $item.BgId
+            BgName        = $item.BgName
+            SourceDB      = $item.SourceDB
+            Profile       = $global:AWSProfile
+            TargetVersion = $item.TargetVersion
+            CreatedAt     = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            Status        = $item.Status
+            Notified      = $false
+            CompletedAt   = $null
+        }
+        $tracked += $newItem
+        $addedCount++
+    }
+
+    if ($addedCount -gt 0) {
+        Save-TrackedBGDeployments -Deployments $tracked | Out-Null
+        Write-Host "`nSuccessfully added $addedCount deployment(s) to tracker!" -ForegroundColor Green
+        if ($alreadyCount -gt 0) {
+            Write-Host "($alreadyCount deployment(s) were already in tracker)" -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host "`nAll selected deployment(s) were already in tracker." -ForegroundColor Yellow
+    }
+
+    Start-Sleep -Seconds 2
+}
+
+function global:Show-TrackedDeployments-View {
+    try { Cleanup-TrackedBGDeployments } catch {}
+    $tracked = @(Get-TrackedBGDeployments)
+    Show-Header
+    Write-Host "=== MY TRACKED BLUE/GREEN DEPLOYMENTS ===" -ForegroundColor Cyan
+    Write-Host "(Only deployments created or selected by you are tracked)`n" -ForegroundColor DarkGray
+
+    if ($tracked.Count -eq 0) {
+        Write-Host "No tracked deployments found." -ForegroundColor Yellow
+        Write-Host "When you create or attach a Blue/Green Deployment, it will appear here." -ForegroundColor DarkGray
+        Write-Host "`n[A] Attach / Track existing AWS deployments | [Enter] Back" -ForegroundColor Cyan
+        $k = Read-Host
+        if ($k -match '^[aA]') {
+            Add-ExistingBGDeployments-Interactive
+            Show-TrackedDeployments-View
+        }
+        return
+    }
+
+    Write-Host ("{0,-36} {1,-14} {2,-16} {3,-20} {4}" -f "Name / ID", "Source DB", "Status", "Created At", "Notified") -ForegroundColor White
+    Write-Host ("-" * 105) -ForegroundColor DarkGray
+
+    foreach ($d in $tracked) {
+        $stColor = switch ($d.Status) {
+            "AVAILABLE" { "Green" }
+            "SWITCHOVER_COMPLETED" { "Green" }
+            "PROVISIONING" { "Yellow" }
+            default { "Red" }
+        }
+        $notifStr = if ($d.Notified) { "[✓ Notified]" } else { "[Pending]" }
+        $notifColor = if ($d.Notified) { "Green" } else { "DarkYellow" }
+
+        $line1 = "{0,-36} {1,-14} " -f $d.BgName, $d.SourceDB
+        $statusPart = Get-AnsiString ("{0,-16}" -f $d.Status) -Color $stColor
+        $datePart = " {0,-20} " -f $d.CreatedAt
+        $notifPart = Get-AnsiString $notifStr -Color $notifColor
+
+        Write-Host "$line1$statusPart$datePart$notifPart"
+        Write-Host "  ID: $($d.BgId) | Target: $($d.TargetVersion) | Profile: $($d.Profile)" -ForegroundColor DarkGray
+    }
+
+    Write-Host "`n[R] Refresh status from AWS now | [A] Attach / Track existing AWS deployments | [Enter] Back" -ForegroundColor Cyan
+    $key = Read-Host
+    if ($key -match '^[rR]') {
+        Write-Host "Checking AWS status for tracked deployments..." -ForegroundColor DarkGray
+        Check-TrackedBGDeployments
+        Show-TrackedDeployments-View
+    } elseif ($key -match '^[aA]') {
+        Add-ExistingBGDeployments-Interactive
+        Show-TrackedDeployments-View
+    }
+}
+
+function global:Show-NotificationSettings-Menu {
+    while ($true) {
+        try { Cleanup-TrackedBGDeployments } catch {}
+        $cfg = Get-BGNotificationConfig
+        $tracked = @(Get-TrackedBGDeployments)
+        $activeCount = @($tracked | Where-Object { -not $_.Notified }).Count
+        $doneCount = @($tracked | Where-Object { $_.Notified }).Count
+
+        $toastStatus = if ($cfg.EnableDesktopToast) { "[ENABLED]" } else { "[DISABLED]" }
+        $soundStatus = if ($cfg.EnableSound) { "[ENABLED]" } else { "[DISABLED]" }
+        $autoStatus  = "[$($cfg.AutoTrackOnCreate)]"
+        $retentionStatus = if ($cfg.RetentionDays -gt 0) { "[$($cfg.RetentionDays) days]" } else { "[DISABLED (Manual)]" }
+
+        $options = @(
+            "Desktop Toast Notification : $toastStatus",
+            "Notification Sound         : $soundStatus",
+            "Auto-track on Creation     : $autoStatus",
+            "Completed Retention Period : $retentionStatus",
+            "------------------------------------------",
+            "Track Existing AWS Deployments (Filter & Select from AWS)",
+            "View My Tracked Deployments ($activeCount active, $doneCount completed)",
+            "Test Notification (Play Sound + Show Toast)",
+            "Clear Completed Deployments ($doneCount completed)",
+            "------------------------------------------",
+            "Back to Previous Menu"
+        )
+
+        $choice = Show-Menu -Title "Notification Settings & Deployment Tracker" -Options $options
+
+        switch ($choice) {
+            0 { # Toggle Toast
+                $cfg.EnableDesktopToast = -not $cfg.EnableDesktopToast
+                Save-BGNotificationConfig -Config $cfg | Out-Null
+            }
+            1 { # Toggle Sound
+                $cfg.EnableSound = -not $cfg.EnableSound
+                Save-BGNotificationConfig -Config $cfg | Out-Null
+            }
+            2 { # Cycle AutoTrack: ALWAYS -> ASK -> DISABLED -> ALWAYS
+                $cfg.AutoTrackOnCreate = switch ($cfg.AutoTrackOnCreate) {
+                    "ALWAYS"   { "ASK" }
+                    "ASK"      { "DISABLED" }
+                    "DISABLED" { "ALWAYS" }
+                    default    { "ALWAYS" }
+                }
+                Save-BGNotificationConfig -Config $cfg | Out-Null
+            }
+            3 { # Cycle RetentionDays: 7 -> 14 -> 30 -> 1 -> 0 -> 7
+                $cfg.RetentionDays = switch ($cfg.RetentionDays) {
+                    7  { 14 }
+                    14 { 30 }
+                    30 { 1 }
+                    1  { 0 }
+                    0  { 7 }
+                    default { 7 }
+                }
+                Save-BGNotificationConfig -Config $cfg | Out-Null
+            }
+            5 { # Track Existing AWS Deployments
+                Add-ExistingBGDeployments-Interactive
+            }
+            6 { # View Tracked Deployments
+                Show-TrackedDeployments-View
+            }
+            7 { # Test Notification
+                Write-Host "`nTesting notification..." -ForegroundColor Cyan
+                Send-BGNotification -Title "RDS BG Manager Test" -Message "This is a test notification from AWS RDS BG Manager." -Status "AVAILABLE"
+                Write-Host "Notification sent. Check desktop and sound." -ForegroundColor Green
+                Start-Sleep -Seconds 2
+            }
+            8 { # Clear Completed
+                $remaining = @($tracked | Where-Object { -not $_.Notified })
+                Save-TrackedBGDeployments -Deployments $remaining | Out-Null
+                Write-Host "`nCleared $doneCount completed deployment(s)." -ForegroundColor Green
+                Start-Sleep -Seconds 1
+            }
+            10 { return }
+            -1 { return }
+        }
+    }
+}
+
 function Get-ProfileColor {
     param (
         [string]$ProfileName,
@@ -736,7 +1248,8 @@ function global:Show-Menu {
         [object[]]$Options,
         [switch]$EnableFilter,
         [switch]$MultiSelect,
-        [int]$MaxSelectionCount = 0
+        [int]$MaxSelectionCount = 0,
+        [int[]]$InitialSelection = @()
     )
 
     # Bridge Show-Menu to Invoke-InteractiveViewportSelection
@@ -779,6 +1292,7 @@ function global:Show-Menu {
         -FooterContent $footerLogic `
         -MultiSelect:$MultiSelect `
         -MaxSelectionCount $MaxSelectionCount `
+        -InitialSelection $InitialSelection `
         -ReturnIndex
 }
 
@@ -808,6 +1322,7 @@ function global:Invoke-InteractiveViewportSelection {
         [string[]]$FilterProperties, # If null, filter on ToString or Label
         [switch]$MultiSelect,
         [int]$MaxSelectionCount = 0,
+        [int[]]$InitialSelection = @(),
         [switch]$ReturnIndex
     )
 
@@ -818,6 +1333,19 @@ function global:Invoke-InteractiveViewportSelection {
 
     # Store indices of selected items (Hash Set for O(1) lookup)
     $selectedIndices = New-Object System.Collections.Generic.HashSet[int]
+    if ($InitialSelection) {
+        foreach ($idx in $InitialSelection) {
+            if ($idx -ge 0 -and $idx -lt $Items.Count) {
+                [void]$selectedIndices.Add($idx)
+            }
+        }
+        if ($selectedIndices.Count -gt 0) {
+            $firstSel = $InitialSelection[0]
+            if ($firstSel -ge 0 -and $firstSel -lt $Items.Count) {
+                $currentIndex = $firstSel
+            }
+        }
+    }
 
     # Hide cursor
     try { [Console]::CursorVisible = $false } catch {}
@@ -925,8 +1453,21 @@ function global:Invoke-InteractiveViewportSelection {
                     $bgCode = "$($global:ESC)[100m"
                     $lineAnsi = "$fgCode$bgCode$rawLabel$($global:ANSI.Reset)"
                 } elseif ($isSelected) {
-                    $fg = "Green"
-                    $lineAnsi = Get-AnsiString $rawLabel -Color $fg
+                    if ($wItem.Color) {
+                        if ($wItem.Color -eq "Green") {
+                            $lineAnsi = Get-AnsiString $rawLabel -Color "Green"
+                        } elseif ($MultiSelect) {
+                            $prefixAnsi = Get-AnsiString $prefix -Color "Green"
+                            $textPart = if ($rawLabel.Length -gt $prefix.Length) { $rawLabel.Substring($prefix.Length) } else { "" }
+                            $textColor = if ($wItem.Color -eq "Gray") { "White" } else { $wItem.Color }
+                            $textAnsi = Get-AnsiString $textPart -Color $textColor
+                            $lineAnsi = "$prefixAnsi$textAnsi"
+                        } else {
+                            $lineAnsi = Get-AnsiString $rawLabel -Color $wItem.Color
+                        }
+                    } else {
+                        $lineAnsi = Get-AnsiString $rawLabel -Color "Green"
+                    }
                 } else {
                     $lineAnsi = Get-AnsiString $rawLabel -Color $fg
                 }
@@ -972,7 +1513,13 @@ function global:Invoke-InteractiveViewportSelection {
 
         # 5. Input Handling Loop
         while (-not [Console]::KeyAvailable) {
-            Start-Sleep -Milliseconds 20
+            Start-Sleep -Milliseconds 50
+            if ($global:EnableBGWatcher -and $global:LastBGWatcherCheck) {
+                if (((Get-Date) - $global:LastBGWatcherCheck).TotalSeconds -ge 60) {
+                    $global:LastBGWatcherCheck = Get-Date
+                    try { Check-TrackedBGDeployments -Silent } catch {}
+                }
+            }
         }
 
         try {
@@ -2398,6 +2945,7 @@ function Show-RDS-Menu {
     Start-InstanceCacheWarmJob
     while ($true) {
         if ($global:RestartSessionSelection) { return }
+        try { Check-TrackedBGDeployments -Silent } catch {}
 
         $menuOptions = @(
             "Select Active Instance",
@@ -2425,6 +2973,7 @@ function Show-RDS-Menu {
             "Apply Pending Maintenance",
             "------------------------------------------",
             "Tag Management (SSG-MONITORING)",
+            "Notification Settings & Tracker",
             "------------------------------------------",
             "Back to Main Menu"
         )
@@ -2454,7 +3003,8 @@ function Show-RDS-Menu {
             21 { Invoke-BatchSwitchoverStop-Interactive }
             22 { Apply-PendingMaintenance }
             24 { Set-RDSMonitoringTag-Interactive }
-            26 { return }
+            25 { Show-NotificationSettings-Menu }
+            27 { return }
         }
     }
 }
@@ -4101,10 +4651,23 @@ function New-BGDeployment-Interactive {
                 $currentFamily = [string]$data.DBEngineVersions[0].DBParameterGroupFamily
             }
 
-            $upgradeOptions = @("Keep Current ($currentVer)")
+            $upgradeOptions = @()
+            $upgradeOptions += [PSCustomObject]@{
+                Label = "Keep Current ($currentVer)"
+                Color = "Cyan"
+                Value = $null
+            }
             if ($validUpgrades) {
-                foreach ($up in $validUpgrades) {
-                    $upgradeOptions += "$($up.EngineVersion) $(if($up.IsMajorVersionUpgrade){'[MAJOR]'}else{'[minor]'}) - $($up.Description)"
+                foreach ($up in @($validUpgrades)) {
+                    $isMajor = [bool]$up.IsMajorVersionUpgrade
+                    $tag = if ($isMajor) { '[MAJOR]' } else { '[minor]' }
+                    $upLabel = "$($up.EngineVersion) $tag - $($up.Description)"
+                    $upColor = if ($isMajor) { "Yellow" } else { "Green" }
+                    $upgradeOptions += [PSCustomObject]@{
+                        Label = $upLabel
+                        Color = $upColor
+                        Value = $up.EngineVersion
+                    }
                 }
             }
 
@@ -4136,8 +4699,8 @@ function New-BGDeployment-Interactive {
                 }
             }
 
-            # User picks version — upgrade jobs run in background during this
-            $selIndices = Show-Menu -Title "Select Target Engine Version (SPACE to Select, ENTER to Confirm, ESC to Cancel)" -Options $upgradeOptions -EnableFilter -MultiSelect -MaxSelectionCount 1
+            # User picks version — upgrade jobs run in background during this (default: Keep Current)
+            $selIndices = Show-Menu -Title "Select Target Engine Version (SPACE to Select, ENTER to Confirm, ESC to Cancel)" -Options $upgradeOptions -EnableFilter -MultiSelect -MaxSelectionCount 1 -InitialSelection @(0)
 
             if ($selIndices -eq -99) {
                 $upgradePgJobs.Values | ForEach-Object { Remove-Job $_ -Force -ErrorAction SilentlyContinue }
@@ -4152,7 +4715,8 @@ function New-BGDeployment-Interactive {
 
             if ($selIndices.Count -gt 0) {
                 $idxVer = $selIndices[0]
-                $targetVer = if ($idxVer -eq 0) { $null } else { $validUpgrades[$idxVer - 1].EngineVersion }
+                $validList = if ($validUpgrades) { @($validUpgrades) } else { @() }
+                $targetVer = if ($idxVer -eq 0 -or $idxVer -gt $validList.Count) { $null } else { $validList[$idxVer - 1].EngineVersion }
             }
 
             # Harvest the job for the chosen version; discard the rest
@@ -4194,6 +4758,28 @@ function New-BGDeployment-Interactive {
     $pgName = $null
     $targetFamily = $currentFamily
 
+    # Determine current parameter group of the source instance
+    $currentPG = $null
+    if ($sourceObj.DBParameterGroups) {
+        $pgList = @($sourceObj.DBParameterGroups)
+        if ($pgList.Count -gt 0 -and $pgList[0].DBParameterGroupName) {
+            $currentPG = [string]$pgList[0].DBParameterGroupName
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($currentPG) -and $sourceDB) {
+        try {
+            $rawInst = Invoke-AWS-WithRetry -Arguments @("rds", "describe-db-instances", "--db-instance-identifier", $sourceDB, "--output", "json", "--profile", $global:AWSProfile) -ReturnJson
+            $instData = ($rawInst -join "") | ConvertFrom-Json
+            if ($instData.DBInstances -and $instData.DBInstances[0].DBParameterGroups) {
+                $rawPgList = @($instData.DBInstances[0].DBParameterGroups)
+                if ($rawPgList.Count -gt 0) {
+                    $currentPG = [string]$rawPgList[0].DBParameterGroupName
+                }
+            }
+        } catch {}
+    }
+    if ($currentPG) { $currentPG = $currentPG.Trim() }
+
     if ($targetFamily) {
         $pgJson = $preloadedPgJson
 
@@ -4224,19 +4810,54 @@ function New-BGDeployment-Interactive {
         if (![string]::IsNullOrWhiteSpace($pgJson)) {
             try {
                 $pgData = $pgJson | ConvertFrom-Json
-                $pgs = $pgData.DBParameterGroups
-                if ($pgs) {
-                    $pgOptions = @("Default (Use Source's Group or Engine Default)")
-                    foreach ($p in $pgs) { $pgOptions += "$($p.DBParameterGroupName) ($($p.Description))" }
+                $pgs = if ($pgData.DBParameterGroups) { @($pgData.DBParameterGroups) } else { @() }
+                if ($pgs.Count -gt 0) {
+                    $pgOptions = @()
+                    $pgOptions += [PSCustomObject]@{
+                        Label = "Default (Use Source's Group or Engine Default)"
+                        Color = "Gray"
+                        Value = $null
+                    }
 
-                    $selPGIndices = Show-Menu -Title "Select Parameter Group (Family: $targetFamily)" -Options $pgOptions -EnableFilter -MultiSelect -MaxSelectionCount 1
+                    $matchedPgIndex = $null
+                    for ($i = 0; $i -lt $pgs.Count; $i++) {
+                        $p = $pgs[$i]
+                        $pName = [string]$p.DBParameterGroupName
+                        $pDesc = [string]$p.Description
+                        
+                        $isCurrent = (![string]::IsNullOrWhiteSpace($currentPG) -and ($pName.Trim() -eq $currentPG))
+                        
+                        $labelBase = if (![string]::IsNullOrWhiteSpace($pDesc)) { "$pName ($pDesc)" } else { $pName }
+                        $label = if ($isCurrent) { "$labelBase [CURRENT]" } else { $labelBase }
+                        $color = if ($isCurrent) { "Green" } else { "Gray" }
+
+                        if ($isCurrent) {
+                            $matchedPgIndex = $i + 1
+                        }
+
+                        $pgOptions += [PSCustomObject]@{
+                            Label = $label
+                            Color = $color
+                            Value = $pName
+                        }
+                    }
+
+                    $pgTitle = if (![string]::IsNullOrWhiteSpace($currentPG)) {
+                        "Select Parameter Group (Family: $targetFamily | Current: $currentPG)"
+                    } else {
+                        "Select Parameter Group (Family: $targetFamily)"
+                    }
+
+                    $initialPGSelection = if ($null -ne $matchedPgIndex) { @($matchedPgIndex) } else { @(0) }
+
+                    $selPGIndices = Show-Menu -Title $pgTitle -Options $pgOptions -EnableFilter -MultiSelect -MaxSelectionCount 1 -InitialSelection $initialPGSelection
 
                     if ($selPGIndices -eq -99) { $global:RestartSessionSelection = $true; return }
                     if ($selPGIndices -is [int] -and $selPGIndices -lt 0) { return }
 
                     if ($selPGIndices.Count -gt 0) {
                         $idxPG = $selPGIndices[0]
-                        if ($idxPG -gt 0) { $pgName = $pgs[$idxPG - 1].DBParameterGroupName }
+                        if ($idxPG -gt 0 -and $idxPG -le $pgs.Count) { $pgName = $pgs[$idxPG - 1].DBParameterGroupName }
                     }
                 }
             } catch {
@@ -4253,8 +4874,8 @@ function New-BGDeployment-Interactive {
     Write-Host "Parameter Group Selected: $displayPG" -ForegroundColor Green
 
     # Offer comparison if user selected a specific PG different from source
-    if ($pgName -and $sourceObj.DBParameterGroups) {
-        $sourcePG = $sourceObj.DBParameterGroups[0].DBParameterGroupName
+    if ($pgName) {
+        $sourcePG = if (![string]::IsNullOrWhiteSpace($currentPG)) { $currentPG } elseif ($sourceObj.DBParameterGroups) { $sourceObj.DBParameterGroups[0].DBParameterGroupName } else { $null }
         if ($sourcePG -and $sourcePG -ne $pgName) {
             $cmpChoice = Read-Host "Compare parameter groups '$sourcePG' vs '$pgName'? (y/N)"
             if ($cmpChoice -eq 'y') {
@@ -4360,6 +4981,27 @@ function New-BGDeployment-Interactive {
         Write-Log "BG Identifier: $bgId" -ForegroundColor Yellow
         Write-Log "Use the 'Monitor' function to track progress."
         $script:BGDeploymentsCache = $null
+
+        # Auto-track for notifications
+        try {
+            $notifCfg = Get-BGNotificationConfig
+            $shouldTrack = $false
+            if ($notifCfg.AutoTrackOnCreate -eq "ALWAYS") {
+                $shouldTrack = $true
+                Write-Host "`n[Notifications] Auto-tracking enabled. You will be notified when deployment is ready." -ForegroundColor Green
+            } elseif ($notifCfg.AutoTrackOnCreate -eq "ASK") {
+                $ans = Read-Host "`nTrack this deployment and notify when ready (Toast + Sound)? (Y/n)"
+                if ($ans -ne 'n') {
+                    $shouldTrack = $true
+                }
+            }
+            if ($shouldTrack) {
+                Add-TrackedBGDeployment -BgId $bgId -BgName $bgName -SourceDB $sourceDB -Profile $global:AWSProfile -TargetVersion $displayVer | Out-Null
+                Write-Host "Deployment registered for notifications! (ID: $bgId)" -ForegroundColor Green
+            }
+        } catch {
+            Write-Log "Could not register deployment for tracking: $_" -ForegroundColor DarkGray
+        }
     } catch {
         $err = $_
         $msg = if ($err.Exception) { $err.Exception.Message } else { $err.ToString() }
@@ -4519,6 +5161,30 @@ function Monitor-BGStatus-Interactive {
         $statusLine = "  STATUS: $(Get-AnsiString $status -Color $statusColor)"
         if ($elapsed) { $statusLine += "$(Get-AnsiString "           Elapsed: $elapsed" -Color DarkGray)" }
         [void]$sb.AppendLine((Pad-Line $statusLine $winWidth))
+
+        # Check if this deployment needs notification in active monitor
+        if ($status -in @("AVAILABLE", "SWITCHOVER_COMPLETED", "FAILED", "SWITCHOVER_FAILED", "INVALID_CONFIGURATION")) {
+            try {
+                $tracked = @(Get-TrackedBGDeployments)
+                $matched = $tracked | Where-Object { $_.BgId -eq $bgId -and -not $_.Notified }
+                if ($matched) {
+                    $isSuccess = ($status -in @("AVAILABLE", "SWITCHOVER_COMPLETED"))
+                    $notifTitle = if ($isSuccess) { "RDS Blue/Green Ready ✓" } else { "RDS Blue/Green Error ⚠" }
+                    $notifMsg = if ($isSuccess) { "Deployment '$bgName' ($sourceId) is $status and ready for switchover!" } else { "Deployment '$bgName' ($sourceId) failed with status: $status" }
+                    Send-BGNotification -Title $notifTitle -Message $notifMsg -Status $status
+                    foreach ($m in $matched) {
+                        $m.Notified = $true
+                        $m.Status = $status
+                        $m.CompletedAt = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    }
+                    Save-TrackedBGDeployments -Deployments $tracked | Out-Null
+                }
+            } catch {}
+        }
+
+        if ($status -eq "AVAILABLE") {
+            [void]$sb.AppendLine((Pad-Line (Get-AnsiString "  *** DEPLOYMENT IS READY FOR SWITCHOVER! ***" -Color Green) $winWidth))
+        }
 
         # StatusDetails
         if ($bg.StatusDetails) {
@@ -6702,11 +7368,13 @@ if ($MyInvocation.InvocationName -ne '.') {
 
         while ($true) {
             if ($global:RestartSessionSelection) { break }
+            try { Check-TrackedBGDeployments -Silent } catch {}
 
             $menuOptions = @(
                 "RDS Management",
                 "EC2 Management",
                 "Client Resource Inventory",
+                "Notification Settings & Tracker",
                 "Quit"
             )
 
@@ -6718,7 +7386,8 @@ if ($MyInvocation.InvocationName -ne '.') {
                 0 { Show-RDS-Menu }
                 1 { Show-EC2-Menu }
                 2 { Show-ClientInventory }
-                3 {
+                3 { Show-NotificationSettings-Menu }
+                4 {
                     # Restore cursor before exit
                     try { [Console]::CursorVisible = $true } catch {}
                     Clear-Host
