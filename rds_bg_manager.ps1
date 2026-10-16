@@ -1,4 +1,4 @@
-# VERSION: 2026.10.16.02
+# VERSION: 2026.10.16.03
 <#
 .SYNOPSIS
     AWS RDS Blue/Green Deployment Manager
@@ -11,11 +11,13 @@
 .CHANGELOG
     2026-10-16
     - FEATURE: Blue/Green Deployment Notifications & Tracker:
-      * Desktop Toast notification (Windows Toast / Linux notify-send) and sound chime when deployment reaches AVAILABLE (ready for switchover) or FAILED.
-      * Isolated tracking of ONLY user-created deployments in local state file (`tracked_deployments.json`), ignoring other concurrent AWS deployments.
+      * Desktop Toast notification (Windows WinRT/NotifyIcon / Linux notify-send) and sound chime when deployment reaches AVAILABLE (ready for switchover) or FAILED.
+      * Isolated tracking of ONLY user-created/user-selected deployments in local state file (`logs/tracked_deployments.json`), completely ignoring other concurrent AWS deployments.
       * External configuration file `rds_bg_notifications.json` with dedicated TUI settings menu (`Show-NotificationSettings-Menu`).
       * Auto-track option (ALWAYS notify without asking / ASK / DISABLED) configurable per user.
       * Background checking while idle in any menu and integrated readiness alert in `Monitor-BGStatus-Interactive`.
+      * Interactive attachment of existing AWS deployments (`Add-ExistingBGDeployments-Interactive`) with live search/filtering and multi-select (SPACE to select, ENTER to confirm).
+      * Retention policy & automatic cleanup (`Cleanup-TrackedBGDeployments`): configurable `RetentionDays` (default: 7 days) automatically purges completed records (`Notified: true`) older than retention window.
     - FEATURE: 'Create Blue/Green Deployment' UI enhancements:
       * Target Engine Version: Minor upgrades highlighted in Green, Major upgrades highlighted in Yellow (less safe), 'Keep Current' highlighted in Cyan and pre-selected by default (toggable with SPACE).
       * Parameter Group: Shows current instance Parameter Group in title, exact-match current PG highlighted in Green with [CURRENT] tag, and pre-selected by default.
@@ -43,7 +45,7 @@
     - UX: Press M in `New-BGDeployment-Interactive` wizard before deployment creation to toggle SSG-MONITORING on source instance.
     - UX: Upgrade Confirmation screen shows SSG-MONITORING tag value (red=ENABLE, green=DISABLE, gray=not set).
     - UX: Tag Management selection list shows colored ENABLE/GREEN, DISABLE/RED, ---/GRAY values with column headers (Instance / Monitoring / Status) and F5 refresh.
-    - BUGFIX: Read-Only profile detection uses `type` field from `~/.aws/config` metadata instead of profile name regex — fixes false positive on profiles like SUDAC-PROD that contain "ro" in name.
+    - BUGFIX: Read-Only profile detection uses `type` field from `~/.aws/config` metadata instead of profile name regex — fixes false positive on profiles like CUSTOM-PROD that contain "ro" in name.
     - BUGFIX: Manual snapshot count now sums instance snapshots + Aurora cluster snapshots (was instance-only). Quota fetched from AWS Service Quotas API (L-272F1212) instead of hardcoded 100.
     - BUGFIX: Snapshot quota check now supports force-bypass option (F key) to proceed despite quota warning.
     - BUGFIX: Retry loop condition fixed (`-lt` instead of `-le`) — was executing 4 retries instead of 3.
@@ -68,7 +70,7 @@
     - STARTUP: Added `Test-StartupDependencies` check at launch — verifies PowerShell version (5.1 OK, 7 recommended; below 5.1 → fatal), AWS CLI v2 presence (v1 or missing → fatal), and `~/.aws/config` existence with at least one profile/SSO session (warning only). Provides `winget` install hints for missing components. Script exits with message on critical failures.
 
     2026-05-26
-    - BUGFIX: Fixed "Missing sso_start_url / sso_region" error for cross-account role profiles (e.g. VESA_BOOMI, VESA_PROD, veri-campus). These profiles use `source_profile` chaining, not a direct `sso_session`. `aws sso login` must target the root SSO profile. Added `Resolve-SSOLoginProfile` which walks the `source_profile` chain to find the correct login target.
+    - BUGFIX: Fixed "Missing sso_start_url / sso_region" error for cross-account role profiles (e.g. child role profiles assuming parent SSO session). These profiles use `source_profile` chaining, not a direct `sso_session`. `aws sso login` must target the root SSO profile. Added `Resolve-SSOLoginProfile` which walks the `source_profile` chain to find the correct login target.
     - BUGFIX: `Get-AWSConfigData` now exposes `SourceProfiles` (child → parent map) in its return value so the chain can be resolved without re-parsing the config file.
     - UX: Added `Invoke-SSOLogin` helper — runs `aws sso login --no-browser` and streams output line-by-line so the verification URL is visible immediately. Once the URL is detected in the stream, the default browser is opened automatically via `Start-Process`. Previously, buffering the full command output caused a silent hang while waiting for auth that never started.
     - UX: Both SSO login paths (`Check-SSOSession` and the expired-token retry in `Invoke-AWS-WithRetry`) now use the new `Invoke-SSOLogin` and `Resolve-SSOLoginProfile` helpers.
@@ -857,7 +859,8 @@ function global:Send-BGNotification {
 function global:Cleanup-TrackedBGDeployments {
     param([int]$Days = -1)
     $cfg = Get-BGNotificationConfig
-    $retention = if ($Days -ge 0) { $Days } else { [int]($cfg.RetentionDays ?? 7) }
+    $ret = if ($cfg.RetentionDays) { [int]$cfg.RetentionDays } else { 7 }
+    $retention = if ($Days -ge 0) { $Days } else { $ret }
     if ($retention -le 0) { return }
 
     $tracked = @(Get-TrackedBGDeployments)
@@ -3110,7 +3113,9 @@ function Get-ManualSnapshotCount {
         $clusterOut  = Invoke-AWS-WithRetry -Arguments $clusterArgs
         $clusterCount = ($clusterOut | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } | Measure-Object -Sum).Sum
 
-        $total = [int]($instCount ?? 0) + [int]($clusterCount ?? 0)
+        $iCount = if ($instCount) { [int]$instCount } else { 0 }
+        $cCount = if ($clusterCount) { [int]$clusterCount } else { 0 }
+        $total = $iCount + $cCount
 
         # Refresh quota limit from Service Quotas (quota code L-272F1212 = Manual DB Snapshots).
         # This rarely changes mid-session, unlike snapshot counts, so fetch it once per profile.
@@ -7253,6 +7258,21 @@ function Test-StartupDependencies {
     Write-Host ""
     Write-Host "  Dependency check" -ForegroundColor Cyan
     Write-Host "  ----------------" -ForegroundColor DarkGray
+
+    # PowerShell ISE check
+    if ($psISE) {
+        Write-Host "  [!!] PowerShell ISE is not supported (interactive TUI requires a standard console)." -ForegroundColor Red
+        Write-Host "       Please run this script in Windows Terminal or PowerShell (pwsh.exe / powershell.exe)." -ForegroundColor Yellow
+        return $false
+    }
+
+    # Console input redirected check
+    try {
+        if ([Console]::IsInputRedirected) {
+            Write-Host "  [!!] Console input is redirected. An interactive terminal is required." -ForegroundColor Red
+            return $false
+        }
+    } catch {}
 
     # PowerShell version
     $psVer = $PSVersionTable.PSVersion
